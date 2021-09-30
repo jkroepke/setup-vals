@@ -1,4 +1,4 @@
-![build-test](https://github.com/mdgreenwald/mozilla-sops-action/workflows/build-test/badge.svg)
+![build-test](https://github.com/jkroepke/setup-vals/workflows/build-test/badge.svg)
 
 ## Setup Vals ##
 GitHub Action for installing [variantdev/vals](https://github.com/variantdev/vals)
