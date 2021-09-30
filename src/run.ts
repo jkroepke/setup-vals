@@ -12,7 +12,7 @@ import * as core from '@actions/core';
 
 const valsToolName = 'vals';
 const stableValsVersion = 'v0.14.0';
-const valsAllReleasesUrl = 'https://github.com/variantdev/vals/releases';
+const valsAllReleasesUrl = 'https://api.github.com/repos/variantdev/vals/releases';
 
 function getExecutableExtension(): string {
     if (os.type().match(/^Win/)) {
