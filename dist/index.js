@@ -6,7 +6,7 @@
 
 "use strict";
 
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Jan-Otto Kröpke
 // Licensed under the MIT license.
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -46,7 +46,7 @@ const toolCache = __importStar(__nccwpck_require__(7784));
 const core = __importStar(__nccwpck_require__(2186));
 const valsToolName = 'vals';
 const stableValsVersion = 'v0.14.0';
-const valsAllReleasesUrl = 'https://github.com/variantdev/vals/releases';
+const valsAllReleasesUrl = 'https://api.github.com/repos/variantdev/vals/releases';
 function getExecutableExtension() {
     if (os.type().match(/^Win/)) {
         return '.exe';
