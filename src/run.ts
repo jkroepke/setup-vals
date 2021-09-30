@@ -46,11 +46,11 @@ async function getStableValsVersion(): Promise<string> {
         let latestValsVersion = semver.clean(stableValsVersion);
         responseArray.forEach(response => {
             if (response && response.tag_name) {
-                let currentValsVerison = semver.clean(response.tag_name.toString());
-                if (currentValsVerison) {
-                    if (currentValsVerison.toString().indexOf('rc') == -1 && semver.gt(currentValsVerison, latestValsVersion)) {
+                let currentValsVersion = semver.clean(response.tag_name.toString());
+                if (currentValsVersion) {
+                    if (currentValsVersion.toString().indexOf('rc') == -1 && semver.gt(currentValsVersion, latestValsVersion)) {
                         //If current vals version is not a pre release and is greater than latest vals version
-                        latestValsVersion = currentValsVerison;
+                        latestValsVersion = currentValsVersion;
                     }
                 }
             }
@@ -94,9 +94,9 @@ async function downloadVals(version: string): Promise<string> {
 
         const valsExtractedFolder = await toolCache.extractTar(valsDownloadPath);
 
-        fs.chmodSync(valsDownloadPath, '777');
+        fs.chmodSync(valsExtractedFolder, '777');
 
-        cachedToolPath = await toolCache.cacheFile(valsExtractedFolder, valsToolName + getExecutableExtension(), valsToolName, version);
+        cachedToolPath = await toolCache.cacheFile(valsExtractedFolder + '/' + valsToolName + getExecutableExtension(), valsToolName + getExecutableExtension(), valsToolName, version);
     }
 
     const valsPath = findVals(cachedToolPath);
