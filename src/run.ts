@@ -1,4 +1,4 @@
-// Copyright (c) Jan-Otto Kroepke
+// Copyright (c) Jan-Otto Kröpke
 // Licensed under the MIT license.
 
 import * as os from 'os';
