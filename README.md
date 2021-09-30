@@ -10,7 +10,7 @@ Acceptable values are latest or any semantic version string like v2.16.7 Use thi
 
 ```yaml
 - name: Sops Binary Installer
-  uses: jkroepke/setup-vals@v1.1.0
+  uses: jkroepke/setup-vals@v1
   with:
     version: '<version>' # default is latest stable
   id: install
