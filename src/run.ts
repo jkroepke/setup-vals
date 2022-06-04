@@ -11,7 +11,7 @@ import * as toolCache from '@actions/tool-cache';
 import * as core from '@actions/core';
 
 const valsToolName = 'vals';
-const stableValsVersion = 'v0.14.0';
+const stableValsVersion = 'v0.16.2';
 const valsAllReleasesUrl = 'https://api.github.com/repos/variantdev/vals/releases';
 
 function getExecutableExtension(): string {
