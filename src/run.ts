@@ -11,7 +11,7 @@ import * as toolCache from '@actions/tool-cache';
 import * as core from '@actions/core';
 
 const valsToolName = 'vals';
-const stableValsVersion = 'v0.16.2';
+const stableValsVersion = 'v0.18.0';
 const valsAllReleasesUrl = 'https://api.github.com/repos/variantdev/vals/releases';
 
 function getExecutableExtension(): string {
@@ -34,6 +34,8 @@ function getValsDownloadURL(version: string): string {
             return util.format('https://github.com/variantdev/vals/releases/download/v%s/vals_%s_darwin_amd64.tar.gz', version, version);
 
         case 'Windows_NT':
+            return util.format('https://github.com/variantdev/vals/releases/download/v%s/vals_%s_windows_amd64.tar.gz', version, version);
+
         default:
             throw new Error(util.format('vals does not provide %s binaries.', os.type()));
     }
@@ -49,7 +51,7 @@ async function getStableValsVersion(): Promise<string> {
                 let currentValsVersion = semver.clean(response.tag_name.toString());
                 if (currentValsVersion) {
                     if (currentValsVersion.toString().indexOf('rc') == -1 && semver.gt(currentValsVersion, latestValsVersion)) {
-                        //If current vals version is not a pre release and is greater than latest vals version
+                        //If a current vals version is not a pre-release and is greater the latest vals version
                         latestValsVersion = currentValsVersion;
                     }
                 }
