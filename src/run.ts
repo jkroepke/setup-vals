@@ -28,13 +28,13 @@ function getValsDownloadURL(version: string): string {
 
     switch (os.type()) {
         case 'Linux':
-            return util.format('https://github.com/variantdev/vals/releases/download/v%s/vals_%s_linux_amd64.tar.gz', version, version);
+            return util.format('https://github.com/helmfile/vals/releases/download/v%s/vals_%s_linux_amd64.tar.gz', version, version);
 
         case 'Darwin':
-            return util.format('https://github.com/variantdev/vals/releases/download/v%s/vals_%s_darwin_amd64.tar.gz', version, version);
+            return util.format('https://github.com/helmfile/vals/releases/download/v%s/vals_%s_darwin_amd64.tar.gz', version, version);
 
         case 'Windows_NT':
-            return util.format('https://github.com/variantdev/vals/releases/download/v%s/vals_%s_windows_amd64.tar.gz', version, version);
+            return util.format('https://github.com/helmfile/vals/releases/download/v%s/vals_%s_windows_amd64.tar.gz', version, version);
 
         default:
             throw new Error(util.format('vals does not provide %s binaries.', os.type()));
