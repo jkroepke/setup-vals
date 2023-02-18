@@ -11,8 +11,8 @@ import * as toolCache from '@actions/tool-cache';
 import * as core from '@actions/core';
 
 const valsToolName = 'vals';
-const stableValsVersion = 'v0.18.0';
-const valsAllReleasesUrl = 'https://api.github.com/repos/variantdev/vals/releases';
+const stableValsVersion = 'v0.22.0';
+const valsAllReleasesUrl = 'https://api.github.com/repos/helmfile/vals/releases';
 
 function getExecutableExtension(): string {
     if (os.type().match(/^Win/)) {

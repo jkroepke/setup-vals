@@ -7,7 +7,7 @@ inputs:
     default: 'latest'
 outputs:
   vals-path:
-    description: 'Path to the cached sops binary'
+    description: 'Path to the cached vals binary'
 branding:
   icon: 'unlock'
   color: 'gray-dark'
