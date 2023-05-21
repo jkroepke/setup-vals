@@ -1,5 +1,5 @@
-name: 'Vals Binary Installer'
-description: 'Install a specific version of the vals binary. Acceptable values are latest or any semantic version string like 0.14.0'
+name: 'vals tools installer'
+description: 'Install a specific version of the helmfile/vals binary. Acceptable values are latest or any semantic version string like 0.14.0'
 inputs:
   version:
     description: 'Version of vals'
@@ -9,7 +9,7 @@ outputs:
   vals-path:
     description: 'Path to the cached vals binary'
 branding:
-  icon: 'unlock'
+  icon: 'wind'
   color: 'gray-dark'
 runs:
   using: node16
