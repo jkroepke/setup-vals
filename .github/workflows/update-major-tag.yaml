@@ -1,0 +1,22 @@
+name: Update Major Tag
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  set-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: |
+          TAG=${{ github.ref_name }}
+          TAG=${TAG/v}
+          TAG=${TAG%%.*}
+          git tag -f ${TAG}
+          git push --tags
+
+
