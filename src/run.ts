@@ -3,16 +3,15 @@
 
 import * as os from 'os';
 import * as path from 'path';
-import * as util from 'util';
 import * as fs from 'fs';
-import * as semver from 'semver';
 
 import * as toolCache from '@actions/tool-cache';
 import * as core from '@actions/core';
+import * as http from "@actions/http-client";
 
-const valsToolName = 'vals';
-const stableValsVersion = 'v0.22.0';
-const valsAllReleasesUrl = 'https://api.github.com/repos/helmfile/vals/releases';
+const toolName = 'vals';
+const githubRepo = 'helmfile/vals';
+const stableVersion = '0.25.0';
 
 function getExecutableExtension(): string {
     if (os.type().match(/^Win/)) {
@@ -21,51 +20,34 @@ function getExecutableExtension(): string {
     return '';
 }
 
-function getValsDownloadURL(version: string): string {
+function getDownloadURL(version: string): string {
     if (version.toLocaleLowerCase().startsWith('v')) {
         version = version.substring(1);
     }
 
-    switch (os.type()) {
-        case 'Linux':
-            return util.format('https://github.com/helmfile/vals/releases/download/v%s/vals_%s_linux_amd64.tar.gz', version, version);
-
-        case 'Darwin':
-            return util.format('https://github.com/helmfile/vals/releases/download/v%s/vals_%s_darwin_amd64.tar.gz', version, version);
-
-        case 'Windows_NT':
-            return util.format('https://github.com/helmfile/vals/releases/download/v%s/vals_%s_windows_amd64.tar.gz', version, version);
-
-        default:
-            throw new Error(util.format('vals does not provide %s binaries.', os.type()));
+    let arch = os.arch()
+    if (arch == 'x64') {
+        arch = 'amd64'
     }
+    let osType = os.type().toLowerCase()
+    if (osType == 'windows_nt') {
+        osType = 'windows'
+    }
+
+    return `https://github.com/${githubRepo}/releases/download/v${version}/${toolName}_${version}_${osType}_${arch}.tar.gz`;
 }
 
-async function getStableValsVersion(): Promise<string> {
+async function getStableVersion(): Promise<string> {
     try {
-        const downloadPath = await toolCache.downloadTool(valsAllReleasesUrl);
-        const responseArray = JSON.parse(fs.readFileSync(downloadPath, 'utf8').toString().trim());
-        let latestValsVersion = semver.clean(stableValsVersion);
-        responseArray.forEach(response => {
-            if (response && response.tag_name) {
-                let currentValsVersion = semver.clean(response.tag_name.toString());
-                if (currentValsVersion) {
-                    if (currentValsVersion.toString().indexOf('rc') == -1 && semver.gt(currentValsVersion, latestValsVersion)) {
-                        //If a current vals version is not a pre-release and is greater the latest vals version
-                        latestValsVersion = currentValsVersion;
-                    }
-                }
-            }
-        });
-        latestValsVersion = "v" + latestValsVersion;
-        return latestValsVersion;
-    } catch (error) {
-        core.warning(util.format("Cannot get the latest vals info from %s. Error %s. Using default vals version %s.", valsAllReleasesUrl, error, stableValsVersion));
+        const httpClient = new http.HttpClient()
+        const res = await httpClient.getJson<any>(`https://github.com/${githubRepo}/releases/latest`)
+        return res.result.tag_name.replace('v', '')
+    } catch (e) {
+        core.warning(`Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. Error ${e}. Using default version ${stableVersion}.`);
     }
 
-    return stableValsVersion;
+    return stableVersion;
 }
-
 
 const walkSync = function (dir, fileList, fileToFind) {
     const files = fs.readdirSync(dir);
@@ -83,39 +65,40 @@ const walkSync = function (dir, fileList, fileToFind) {
     return fileList;
 };
 
-async function downloadVals(version: string): Promise<string> {
-    if (!version) { version = await getStableValsVersion(); }
-    let cachedToolPath = toolCache.find(valsToolName, version);
+async function downloadBinary(version: string): Promise<string> {
+    if (!version) { version = await getStableVersion(); }
+    let cachedToolPath = toolCache.find(toolName, version);
     if (!cachedToolPath) {
-        let valsDownloadPath;
+        let downloadUrl = getDownloadURL(version);
+        let downloadPath;
         try {
-            valsDownloadPath = await toolCache.downloadTool(getValsDownloadURL(version));
+            downloadPath = await toolCache.downloadTool(downloadUrl);
         } catch (exception) {
-            throw new Error(util.format("Failed to download vals from location ", getValsDownloadURL(version)));
+            throw new Error(`Failed to download ${toolName} from location ${downloadUrl}`);
         }
 
-        const valsExtractedFolder = await toolCache.extractTar(valsDownloadPath);
+        const extractedFolder = await toolCache.extractTar(downloadPath);
 
-        fs.chmodSync(valsExtractedFolder, '777');
+        fs.chmodSync(extractedFolder, '777');
 
-        cachedToolPath = await toolCache.cacheFile(valsExtractedFolder + '/' + valsToolName + getExecutableExtension(), valsToolName + getExecutableExtension(), valsToolName, version);
+        cachedToolPath = await toolCache.cacheFile(extractedFolder + '/' + toolName + getExecutableExtension(), toolName + getExecutableExtension(), toolName, version);
     }
 
-    const valsPath = findVals(cachedToolPath);
-    if (!valsPath) {
-        throw new Error(util.format("vals executable not found in path ", cachedToolPath));
+    const binaryPath = findBinary(cachedToolPath);
+    if (!binaryPath) {
+        throw new Error(`${toolName} executable not found in path ${cachedToolPath}`);
     }
 
-    fs.chmodSync(valsPath, '777');
-    return valsPath;
+    fs.chmodSync(binaryPath, '777');
+    return binaryPath;
 }
 
-function findVals(rootFolder: string): string {
+function findBinary(rootFolder: string): string {
     fs.chmodSync(rootFolder, '777');
     const fileList: string[] = [];
-    walkSync(rootFolder, fileList, valsToolName + getExecutableExtension());
+    walkSync(rootFolder, fileList, toolName + getExecutableExtension());
     if (!fileList) {
-        throw new Error(util.format("Vals executable not found in path ", rootFolder));
+        throw new Error(`${toolName} executable not found in path ${rootFolder}`);
     }
     else {
         return fileList[0];
@@ -123,14 +106,14 @@ function findVals(rootFolder: string): string {
 }
 
 async function run() {
-    let version = core.getInput('version', { 'required': true });
+    let version = core.getInput('version', { 'required': true }).replace('v', '');
     if (version.toLocaleLowerCase() === 'latest') {
-        version = await getStableValsVersion();
+        version = await getStableVersion();
     } else if (!version.toLocaleLowerCase().startsWith('v')) {
         version = 'v' + version;
     }
 
-    let cachedPath = await downloadVals(version);
+    let cachedPath = await downloadBinary(version);
 
     try {
         if (!process.env['PATH'].startsWith(path.dirname(cachedPath))) {
@@ -141,8 +124,8 @@ async function run() {
         //do nothing, set as output variable
     }
 
-    console.log(`Vals tool version: '${version}' has been cached at ${cachedPath}`);
-    core.setOutput('vals-path', cachedPath);
+    console.log(`${toolName} tool version: '${version}' has been cached at ${cachedPath}`);
+    core.setOutput(`${toolName}-path`, cachedPath);
 }
 
 run().catch(core.setFailed);
