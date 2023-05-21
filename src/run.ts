@@ -26,11 +26,11 @@ function getDownloadURL(version: string): string {
     }
 
     let arch = os.arch()
-    if (arch == 'x64') {
+    if (arch === 'x64') {
         arch = 'amd64'
     }
     let osType = os.type().toLowerCase()
-    if (osType == 'windows_nt') {
+    if (osType === 'windows_nt') {
         osType = 'windows'
     }
 
@@ -41,7 +41,7 @@ async function getStableVersion(): Promise<string> {
     try {
         const httpClient = new http.HttpClient()
         const res = await httpClient.getJson<any>(`https://github.com/${githubRepo}/releases/latest`)
-        return res.result.tag_name.replace('v', '')
+        return res.result.tag_name
     } catch (e) {
         core.warning(`Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. Error ${e}. Using default version ${stableVersion}.`);
     }
@@ -106,7 +106,7 @@ function findBinary(rootFolder: string): string {
 }
 
 async function run() {
-    let version = core.getInput('version', { 'required': true }).replace('v', '');
+    let version = core.getInput('version', { 'required': true });
     if (version.toLocaleLowerCase() === 'latest') {
         version = await getStableVersion();
     } else if (!version.toLocaleLowerCase().startsWith('v')) {

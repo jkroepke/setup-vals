@@ -1,5 +1,5 @@
 {
-  "name": "setupvals",
+  "name": "@jkroepke/setup-vals",
   "version": "0.0.0",
   "private": true,
   "description": "Setup vals",
