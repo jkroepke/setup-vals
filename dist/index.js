@@ -558,7 +558,7 @@ class OidcClient {
                 .catch(error => {
                 throw new Error(`Failed to get ID Token. \n 
         Error Code : ${error.statusCode}\n 
-        Error Message: ${error.result.message}`);
+        Error Message: ${error.message}`);
             });
             const id_token = (_a = res.result) === null || _a === void 0 ? void 0 : _a.value;
             if (!id_token) {
@@ -1946,6 +1946,19 @@ class HttpClientResponse {
             }));
         });
     }
+    readBodyBuffer() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise((resolve) => __awaiter(this, void 0, void 0, function* () {
+                const chunks = [];
+                this.message.on('data', (chunk) => {
+                    chunks.push(chunk);
+                });
+                this.message.on('end', () => {
+                    resolve(Buffer.concat(chunks));
+                });
+            }));
+        });
+    }
 }
 exports.HttpClientResponse = HttpClientResponse;
 function isHttps(requestUrl) {
@@ -2450,7 +2463,13 @@ function getProxyUrl(reqUrl) {
         }
     })();
     if (proxyVar) {
-        return new URL(proxyVar);
+        try {
+            return new URL(proxyVar);
+        }
+        catch (_a) {
+            if (!proxyVar.startsWith('http://') && !proxyVar.startsWith('https://'))
+                return new URL(`http://${proxyVar}`);
+        }
     }
     else {
         return undefined;
@@ -6693,7 +6712,7 @@ const core = __nccwpck_require__(2186);
 const http = __nccwpck_require__(6255);
 const toolName = 'vals';
 const githubRepo = 'helmfile/vals';
-const stableVersion = '0.25.0';
+const stableVersion = '0.27.1';
 function getExecutableExtension() {
     if (os.type().match(/^Win/)) {
         return '.exe';
@@ -6734,7 +6753,7 @@ const walkSync = function (dir, fileList, fileToFind) {
         }
         else {
             core.debug(file);
-            if (file == fileToFind) {
+            if (file === fileToFind) {
                 fileList.push(path.join(dir, file));
             }
         }
@@ -6747,7 +6766,7 @@ async function downloadBinary(version) {
     }
     let cachedToolPath = toolCache.find(toolName, version);
     if (!cachedToolPath) {
-        let downloadUrl = getDownloadURL(version);
+        const downloadUrl = getDownloadURL(version);
         let downloadPath;
         try {
             downloadPath = await toolCache.downloadTool(downloadUrl);
@@ -6785,7 +6804,7 @@ async function run() {
     else if (!version.toLocaleLowerCase().startsWith('v')) {
         version = 'v' + version;
     }
-    let cachedPath = await downloadBinary(version);
+    const cachedPath = await downloadBinary(version);
     try {
         if (!process.env['PATH'].startsWith(path.dirname(cachedPath))) {
             core.addPath(path.dirname(cachedPath));
@@ -6794,7 +6813,6 @@ async function run() {
     catch {
         //do nothing, set as output variable
     }
-    console.log(`${toolName} tool version: '${version}' has been cached at ${cachedPath}`);
     core.setOutput(`${toolName}-path`, cachedPath);
 }
 run().catch(core.setFailed);
