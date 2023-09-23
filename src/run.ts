@@ -11,7 +11,7 @@ import * as http from "@actions/http-client";
 
 const toolName = 'vals';
 const githubRepo = 'helmfile/vals';
-const stableVersion = '0.25.0';
+const stableVersion = '0.27.1';
 
 function getExecutableExtension(): string {
     if (os.type().match(/^Win/)) {
@@ -49,7 +49,7 @@ async function getStableVersion(): Promise<string> {
     return stableVersion;
 }
 
-const walkSync = function (dir, fileList, fileToFind) {
+const walkSync = function (dir: string, fileList: string[], fileToFind: string) {
     const files = fs.readdirSync(dir);
     fileList = fileList || [];
     files.forEach(function (file) {
@@ -69,8 +69,8 @@ async function downloadBinary(version: string): Promise<string> {
     if (!version) { version = await getStableVersion(); }
     let cachedToolPath = toolCache.find(toolName, version);
     if (!cachedToolPath) {
-        let downloadUrl = getDownloadURL(version);
-        let downloadPath;
+        const downloadUrl = getDownloadURL(version);
+        let downloadPath: string;
         try {
             downloadPath = await toolCache.downloadTool(downloadUrl);
         } catch (exception) {
@@ -113,7 +113,7 @@ async function run() {
         version = 'v' + version;
     }
 
-    let cachedPath = await downloadBinary(version);
+    const cachedPath = await downloadBinary(version);
 
     try {
         if (!process.env['PATH'].startsWith(path.dirname(cachedPath))) {
@@ -124,7 +124,6 @@ async function run() {
         //do nothing, set as output variable
     }
 
-    console.log(`${toolName} tool version: '${version}' has been cached at ${cachedPath}`);
     core.setOutput(`${toolName}-path`, cachedPath);
 }
 
