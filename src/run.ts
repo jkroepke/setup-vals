@@ -57,7 +57,7 @@ const walkSync = function (dir: string, fileList: string[], fileToFind: string) 
             fileList = walkSync(path.join(dir, file), fileList, fileToFind);
         } else {
             core.debug(file);
-            if (file == fileToFind) {
+            if (file === fileToFind) {
                 fileList.push(path.join(dir, file));
             }
         }
