@@ -18,7 +18,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "devDependencies": {
-    "@types/node": "^20.10.6",
+    "@types/node": "^20.11.15",
     "@typescript-eslint/eslint-plugin": "^6.20.0",
     "@vercel/ncc": "^0.38.1",
     "eslint": "^8.56.0",
