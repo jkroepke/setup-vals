@@ -66,8 +66,7 @@ typings/
 .yarn-integrity
 
 # dotenv environment variables file
-.env
-.env.test
+.local
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -96,3 +95,5 @@ Thumbs.db
 
 # Ignore built ts files
 __tests__/runner/*
+
+.idea
