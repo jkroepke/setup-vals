@@ -1,15 +1,11 @@
 {
-    "compilerOptions": {
-        "lib": ["ES2021"],
-        "target": "ES2021",
-        "module": "commonjs",
-        "outDir": "./lib",
-        "rootDir": "./src",
-        "noImplicitAny": false,
-        "esModuleInterop": false
-    },
-    "exclude": [
-        "node_modules",
-        "**/*.test.ts"
-    ]
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "./dist"
+  },
+  "exclude": ["__fixtures__", "__tests__", "coverage", "dist", "node_modules"],
+  "include": ["src"]
 }

@@ -18,5 +18,3 @@ jobs:
           TAG=${TAG%%.*}
           git tag -f ${TAG}
           git push --tags --force
-
-
