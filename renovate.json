@@ -19,6 +19,13 @@
       "enabled": true
     },
     {
+      "groupName": ["node dependencies"],
+      "matchManagers": ["npm"],
+      "enabled": true,
+      "separateMajorMinor": true,
+      "separateMultipleMajor": true
+    },
+    {
       "groupName": "GitHub Actions",
       "matchManagers": ["github-actions"]
     },
