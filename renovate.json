@@ -4,6 +4,11 @@
   "labels": ["🛠️ dependencies"],
   "timezone": "Europe/Berlin",
   "schedule": ["* 14-17 * * 5"],
+  "automerge": true,
+  "platformAutomerge": true,
+  "suppressNotifications": ["prEditedNotification"],
+  "semanticCommits": "enabled",
+  "ignorePaths": ["**/dist/**"],
   "packageRules": [
     {
       "groupName": "golangci-lint",
@@ -19,15 +24,17 @@
       "enabled": true
     },
     {
-      "groupName": ["node dependencies"],
+      "groupName": "node dependencies",
       "matchManagers": ["npm"],
       "enabled": true,
       "separateMajorMinor": true,
-      "separateMultipleMajor": true
+      "separateMultipleMajor": true,
+      "postUpdateOptions": ["npmDedupe"]
     },
     {
       "groupName": "GitHub Actions",
-      "matchManagers": ["github-actions"]
+      "matchManagers": ["github-actions"],
+      "semanticCommitScope": "github-actions"
     },
     {
       "groupName": "golang.org/x/",
@@ -43,7 +50,7 @@
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": ["."],
+      "managerFilePatterns": ["/./"],
       "matchStrings": [
         "[\\t ]*(?:#|//) ?renovate: (?<datasource>git-refs)=(?<depName>\\S+)(?: branch=(?<currentValue>\\S+))?[\\t ]*\\r?\\n.+?[:=][\\t ]*[\"']?(?<currentDigest>[a-f0-9]+)[\"']?",
         "[\\t ]*(?:#|//) ?renovate: (?<datasource>[^=]+)=(?<depName>\\S+)(?: registry=(?<registryUrl>\\S+))?(?: versioning=(?<versioning>\\S+))?[\\t ]*\\r?\\n.+?[:=][\\t ]*[\"']?(?<currentValue>[^@\\s\"'=]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?[\"']?"
@@ -54,13 +61,13 @@
     },
     {
       "customType": "regex",
-      "fileMatch": ["Makefile"],
+      "managerFilePatterns": ["/Makefile/"],
       "matchStrings": ["go run (?<depName>\\S+)@(?<currentValue>\\S+)"],
       "datasourceTemplate": "go"
     },
     {
       "customType": "regex",
-      "fileMatch": ["(^|/).+\\.yaml$"],
+      "managerFilePatterns": ["/(^|/).+\\.yaml$/"],
       "matchStrings": [
         "[\\t ]*image:[\\t ]*\\r?\\n[\\t ]*registry:[\\t ]*[\"']?(?<registry>.*?)[\"']?[\\t ]*\\r?\\n[\\t ]*(?:repository|name):[\\t ]*[\"']?(?<repository>.*?)[\"']?[\\t ]*\\r?\\n[\\t ]*tag:[\\t ]*[\"']?(?<currentValue>[\\w\\.+-]*)(?:@(?<currentDigest>sha256:[a-f0-9]+))?[\"']?",
         "[\\t ]*image:[\\t ]*[\"']?(?<registry>.+\\..+?)/(?<repository>.*?):(?<currentValue>[\\w\\.+-]*)(?:@(?<currentDigest>sha256:[a-f0-9]+))?[\"']?"
