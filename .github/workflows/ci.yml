@@ -36,17 +36,17 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./
       - name: Get the version
-        run: vals --version
+        run: vals version
       - uses: ./
         with:
           version: v0.40.0
       - name: Get the version
-        run: vals --version | grep 0.40.0
+        run: vals version | grep 0.40.0
       - uses: ./
         with:
           version: 0.28.0
       - name: Get the version
-        run: vals --version | grep 0.28.0
+        run: vals version | grep 0.28.0
 
   super-lint:
     name: super-lint
