@@ -1,6 +1,7 @@
 import type * as core from '@actions/core'
 import { jest } from '@jest/globals'
 
+export const addPath = jest.fn<typeof core.addPath>()
 export const debug = jest.fn<typeof core.debug>()
 export const error = jest.fn<typeof core.error>()
 export const info = jest.fn<typeof core.info>()
