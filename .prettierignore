@@ -1,3 +1,4 @@
 .github/**/*.yaml
+.github/**/*.md
 dist/*
 CODE_OF_CONDUCT.md

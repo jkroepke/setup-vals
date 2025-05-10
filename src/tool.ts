@@ -23,3 +23,7 @@ export async function extractBinary(
 
   return `${extractedFolder}/${toolName}${os === 'windows' ? '.exe' : ''}`
 }
+
+export function getVersionArguments(): string[] {
+  return ['version']
+}
