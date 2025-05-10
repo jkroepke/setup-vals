@@ -1,6 +1,7 @@
 import fs from 'fs'
 
 import * as core from '@actions/core'
+import { exec } from '@actions/exec'
 import { HttpClient } from '@actions/http-client'
 import * as toolCache from '@actions/tool-cache'
 
@@ -9,7 +10,8 @@ import {
   githubRepository,
   toolName,
   defaultVersion,
-  extractBinary
+  extractBinary,
+  getVersionArguments
 } from './tool.js'
 
 /**
@@ -166,6 +168,11 @@ export async function run(): Promise<void> {
       `${toolName} version: '${version}' has been cached at ${cachedPath}`
     )
     core.setOutput('path', cachedPath)
+
+    await exec(
+      cachedPath + '/' + toolName + getExecutableExtension(),
+      getVersionArguments()
+    )
   } catch (error) {
     // Fail the workflow run if an error occurs
     if (error instanceof Error) core.setFailed(error.message)
