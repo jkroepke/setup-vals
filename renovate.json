@@ -3,7 +3,7 @@
   "extends": ["config:recommended", "helpers:pinGitHubActionDigestsToSemver"],
   "labels": ["🛠️ dependencies"],
   "timezone": "Europe/Berlin",
-  "schedule": ["* 14-17 * * 5"],
+  "schedule": ["* 10-20 * * 5"],
   "automerge": true,
   "platformAutomerge": true,
   "suppressNotifications": ["prEditedNotification"],
@@ -24,8 +24,8 @@
       "enabled": true
     },
     {
-      "groupName": "node dependencies",
-      "matchManagers": ["npm"],
+      "groupName": "dependencies",
+      "matchManagers": ["npm", "custom.regex"],
       "enabled": true,
       "separateMajorMinor": true,
       "separateMultipleMajor": true,
@@ -35,6 +35,12 @@
       "groupName": "GitHub Actions",
       "matchManagers": ["github-actions"],
       "semanticCommitScope": "github-actions"
+    },
+    {
+      "groupName": "dev dependencies",
+      "matchDepTypes": ["devDependencies", "optionalDependencies"],
+      "matchManagers": ["npm"],
+      "semanticCommitScope": "dev"
     },
     {
       "groupName": "golang.org/x/",
