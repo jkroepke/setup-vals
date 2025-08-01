@@ -40,7 +40,7 @@
     "@rollup/plugin-node-resolve": "16.0.1",
     "@rollup/plugin-typescript": "12.1.4",
     "@types/jest": "30.0.0",
-    "@types/node": "22.16.5",
+    "@types/node": "22.17.0",
     "@types/semver": "7.7.0",
     "@typescript-eslint/eslint-plugin": "8.38.0",
     "@typescript-eslint/parser": "8.38.0",
@@ -56,13 +56,13 @@
     "make-coverage-badge": "1.2.0",
     "prettier": "3.6.2",
     "prettier-eslint": "16.4.2",
-    "rollup": "4.45.1",
+    "rollup": "4.46.2",
     "semantic-release": "24.2.7",
     "ts-jest": "29.4.0",
     "ts-jest-resolver": "2.0.1",
-    "typescript": "5.8.3"
+    "typescript": "5.9.2"
   },
   "optionalDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "4.45.1"
+    "@rollup/rollup-linux-x64-gnu": "4.46.2"
   }
 }
