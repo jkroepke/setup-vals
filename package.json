@@ -58,7 +58,7 @@
     "prettier-eslint": "16.4.2",
     "rollup": "4.51.0",
     "semantic-release": "24.2.8",
-    "ts-jest": "29.4.3",
+    "ts-jest": "29.4.4",
     "ts-jest-resolver": "2.0.1",
     "typescript": "5.9.2"
   },
