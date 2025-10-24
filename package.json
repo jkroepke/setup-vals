@@ -34,18 +34,18 @@
   },
   "devDependencies": {
     "@eslint/compat": "1.4.0",
-    "@github/local-action": "6.0.0",
+    "@github/local-action": "6.0.2",
     "@jest/globals": "30.2.0",
     "@rollup/plugin-commonjs": "28.0.8",
     "@rollup/plugin-node-resolve": "16.0.3",
-    "@rollup/plugin-typescript": "12.1.4",
+    "@rollup/plugin-typescript": "12.3.0",
     "@types/jest": "30.0.0",
-    "@types/node": "24.8.1",
+    "@types/node": "24.9.1",
     "@types/semver": "7.7.1",
-    "@typescript-eslint/eslint-plugin": "8.46.1",
-    "@typescript-eslint/parser": "8.46.1",
+    "@typescript-eslint/eslint-plugin": "8.46.2",
+    "@typescript-eslint/parser": "8.46.2",
     "cross-env": "10.1.0",
-    "eslint": "9.37.0",
+    "eslint": "9.38.0",
     "eslint-config-prettier": "10.1.8",
     "eslint-import-resolver-typescript": "4.4.4",
     "eslint-plugin-import": "2.32.0",
@@ -56,13 +56,13 @@
     "make-coverage-badge": "1.2.0",
     "prettier": "3.6.2",
     "prettier-eslint": "16.4.2",
-    "rollup": "4.52.4",
-    "semantic-release": "25.0.0",
+    "rollup": "4.52.5",
+    "semantic-release": "25.0.1",
     "ts-jest": "29.4.5",
     "ts-jest-resolver": "2.0.1",
     "typescript": "5.9.3"
   },
   "optionalDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "4.52.4"
+    "@rollup/rollup-linux-x64-gnu": "4.52.5"
   }
 }
