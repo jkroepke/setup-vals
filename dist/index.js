@@ -34146,7 +34146,7 @@ var semverExports = requireSemver();
 const toolName = 'vals';
 const githubRepository = 'helmfile/vals';
 // renovate: github=helmfile/vals
-const defaultVersion = 'v0.42.4';
+const defaultVersion = 'v0.42.5';
 function binaryName(version, os, arch) {
     version = semverExports.clean(version) || version;
     return `${toolName}_${version}_${os}_${arch}.tar.gz`;

@@ -5,7 +5,7 @@ export const toolName = 'vals'
 export const githubRepository = 'helmfile/vals'
 
 // renovate: github=helmfile/vals
-export const defaultVersion = 'v0.42.4'
+export const defaultVersion = 'v0.42.5'
 
 export function binaryName(version: string, os: string, arch: string): string {
   version = clean(version) || version
