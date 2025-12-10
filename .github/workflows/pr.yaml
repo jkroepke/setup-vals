@@ -48,15 +48,11 @@ jobs:
     name: check title prefix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - name: check
-        run: |
-          PR_TITLE_PREFIX=$(echo "$PR_TITLE" | cut -d':' -f1)
-          if [[ "$PR_TITLE_PREFIX" == "fix"* ]] || [[ "$PR_TITLE_PREFIX" == "feat"* ]] || [[ "$PR_TITLE_PREFIX" == "chore"* ]]; then
-            exit 0
-          fi
-
-          echo "PR title must start with feat, fix or chore"
-          exit 1
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
+        if: >-
+          !startsWith(github.event.pull_request.title, 'fix') &&
+          !startsWith(github.event.pull_request.title, 'feat') &&
+          !startsWith(github.event.pull_request.title, 'chore') &&
+          !startsWith(github.event.pull_request.title, 'docs')
+        run: >-
+          echo "PR title must start with feat, fix or chore" && exit 1
