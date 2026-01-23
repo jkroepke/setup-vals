@@ -42,8 +42,8 @@
     "@types/jest": "30.0.0",
     "@types/node": "24.10.9",
     "@types/semver": "7.7.1",
-    "@typescript-eslint/eslint-plugin": "8.53.0",
-    "@typescript-eslint/parser": "8.53.0",
+    "@typescript-eslint/eslint-plugin": "8.53.1",
+    "@typescript-eslint/parser": "8.53.1",
     "cross-env": "10.1.0",
     "eslint": "9.39.2",
     "eslint-config-prettier": "10.1.8",
@@ -54,15 +54,15 @@
     "husky": "9.1.7",
     "jest": "30.2.0",
     "make-coverage-badge": "1.2.0",
-    "prettier": "3.8.0",
+    "prettier": "3.8.1",
     "prettier-eslint": "16.4.2",
-    "rollup": "4.55.1",
+    "rollup": "4.56.0",
     "semantic-release": "25.0.2",
     "ts-jest": "29.4.6",
     "ts-jest-resolver": "2.0.1",
     "typescript": "5.9.3"
   },
   "optionalDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "4.55.1"
+    "@rollup/rollup-linux-x64-gnu": "4.56.0"
   }
 }
