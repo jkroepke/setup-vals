@@ -45,7 +45,7 @@
     "@typescript-eslint/eslint-plugin": "8.56.0",
     "@typescript-eslint/parser": "8.56.0",
     "cross-env": "10.1.0",
-    "eslint": "9.39.2",
+    "eslint": "9.39.3",
     "eslint-config-prettier": "10.1.8",
     "eslint-import-resolver-typescript": "4.4.4",
     "eslint-plugin-import": "2.32.0",
@@ -56,13 +56,13 @@
     "make-coverage-badge": "1.2.0",
     "prettier": "3.8.1",
     "prettier-eslint": "16.4.2",
-    "rollup": "4.57.1",
+    "rollup": "4.58.0",
     "semantic-release": "25.0.3",
     "ts-jest": "29.4.6",
     "ts-jest-resolver": "2.0.1",
     "typescript": "5.9.3"
   },
   "optionalDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "4.57.1"
+    "@rollup/rollup-linux-x64-gnu": "4.58.0"
   }
 }
