@@ -118,10 +118,10 @@ async function download(version: string): Promise<string> {
     let downloadPath
     try {
       downloadPath = await toolCache.downloadTool(url)
-    } catch (exception) {
-      throw new Error(
-        `Failed to download ${toolName} from location ${url}. Error: ${exception}`
-      )
+    } catch (error) {
+      throw new Error(`Failed to download ${toolName} from location ${url}.`, {
+        cause: error
+      })
     }
 
     const extractedPath = await extractBinary(
