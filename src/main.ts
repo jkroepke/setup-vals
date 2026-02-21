@@ -78,7 +78,8 @@ async function latestVersion(
 
     if (res.statusCode !== 200 || !res.result || !res.result.tag_name) {
       core.warning(
-        `Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. Invalid response: ${JSON.stringify(res)}. Using default version ${stableVersion}.`
+        `Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. ` +
+          `Invalid response: ${JSON.stringify(res)}. Using default version ${stableVersion}.`
       )
 
       return stableVersion
@@ -87,7 +88,8 @@ async function latestVersion(
     return res.result.tag_name.trim()
   } catch (e) {
     core.warning(
-      `Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. Error ${e}. Using default version ${stableVersion}.`
+      `Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. ` +
+        `Error ${e}. Using default version ${stableVersion}.`
     )
   }
 

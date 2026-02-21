@@ -32925,13 +32925,15 @@ async function latestVersion(githubRepo, toolName, stableVersion) {
         const httpClient = new HttpClient();
         const res = await httpClient.getJson(`https://github.com/${githubRepo}/releases/latest`);
         if (res.statusCode !== 200 || !res.result || !res.result.tag_name) {
-            warning(`Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. Invalid response: ${JSON.stringify(res)}. Using default version ${stableVersion}.`);
+            warning(`Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. ` +
+                `Invalid response: ${JSON.stringify(res)}. Using default version ${stableVersion}.`);
             return stableVersion;
         }
         return res.result.tag_name.trim();
     }
     catch (e) {
-        warning(`Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. Error ${e}. Using default version ${stableVersion}.`);
+        warning(`Cannot get the latest ${toolName} info from https://github.com/${githubRepo}/releases/latest. ` +
+            `Error ${e}. Using default version ${stableVersion}.`);
     }
     return stableVersion;
 }
