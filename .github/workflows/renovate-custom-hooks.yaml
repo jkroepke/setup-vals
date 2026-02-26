@@ -110,7 +110,7 @@ jobs:
           # Call GitHub API
           curl https://api.github.com/graphql -f \
             -sSf -H "Authorization: Bearer $GITHUB_TOKEN" \
-            --data "@$JSON_PAYLOAD_FILE"
+            --data "@${JSON_PAYLOAD_FILE}"
 
           # Clean up temporary files
           rm "$FILE_CHANGES_JSON_FILE" "$JSON_PAYLOAD_FILE"
