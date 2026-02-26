@@ -11,3 +11,8 @@ max_line_length = 160
 
 [{README.md,.github/{workflows,ISSUE_TEMPLATE}/*.yaml}]
 max_line_length = 200
+
+[dist/**]
+max_line_length = off
+indent_style = unset
+trim_trailing_whitespace = unset
