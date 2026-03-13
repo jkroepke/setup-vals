@@ -13730,7 +13730,7 @@ function requireBalancedPool () {
 	} = requirePoolBase();
 	const Pool = requirePool();
 	const { kUrl } = requireSymbols();
-	const { parseOrigin } = requireUtil$5();
+	const util = requireUtil$5();
 	const kFactory = Symbol('factory');
 
 	const kOptions = Symbol('options');
@@ -13772,7 +13772,10 @@ function requireBalancedPool () {
 
 	    super();
 
-	    this[kOptions] = opts;
+	    this[kOptions] = { ...util.deepClone(opts) };
+	    this[kOptions].interceptors = opts.interceptors
+	      ? { ...opts.interceptors }
+	      : undefined;
 	    this[kIndex] = -1;
 	    this[kCurrentWeight] = 0;
 
@@ -13792,7 +13795,7 @@ function requireBalancedPool () {
 	  }
 
 	  addUpstream (upstream) {
-	    const upstreamOrigin = parseOrigin(upstream).origin;
+	    const upstreamOrigin = util.parseOrigin(upstream).origin;
 
 	    if (this[kClients].find((pool) => (
 	      pool[kUrl].origin === upstreamOrigin &&
@@ -13801,7 +13804,7 @@ function requireBalancedPool () {
 	    ))) {
 	      return this
 	    }
-	    const pool = this[kFactory](upstreamOrigin, Object.assign({}, this[kOptions]));
+	    const pool = this[kFactory](upstreamOrigin, this[kOptions]);
 
 	    this[kAddClient](pool);
 	    pool.on('connect', () => {
@@ -13841,7 +13844,7 @@ function requireBalancedPool () {
 	  }
 
 	  removeUpstream (upstream) {
-	    const upstreamOrigin = parseOrigin(upstream).origin;
+	    const upstreamOrigin = util.parseOrigin(upstream).origin;
 
 	    const pool = this[kClients].find((pool) => (
 	      pool[kUrl].origin === upstreamOrigin &&
@@ -13857,7 +13860,7 @@ function requireBalancedPool () {
 	  }
 
 	  getUpstream (upstream) {
-	    const upstreamOrigin = parseOrigin(upstream).origin;
+	    const upstreamOrigin = util.parseOrigin(upstream).origin;
 
 	    return this[kClients].find((pool) => (
 	      pool[kUrl].origin === upstreamOrigin &&
