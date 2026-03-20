@@ -8814,10 +8814,10 @@ function requireFormdataParser () {
 	const { webidl } = requireWebidl();
 	const assert = require$$0$1;
 	const { isomorphicDecode } = requireInfra();
-	const { utf8DecodeBytes } = requireEncoding();
 
 	const dd = Buffer.from('--');
 	const decoder = new TextDecoder();
+	const decoderIgnoreBOM = new TextDecoder('utf-8', { ignoreBOM: true });
 
 	/**
 	 * @param {string} chars
@@ -8996,7 +8996,7 @@ function requireFormdataParser () {
 	      // 5.11. Otherwise:
 
 	      // 5.11.1. Let value be the UTF-8 decoding without BOM of body.
-	      value = utf8DecodeBytes(Buffer.from(body));
+	      value = decoderIgnoreBOM.decode(Buffer.from(body));
 	    }
 
 	    // 5.12. Assert: name is a scalar value string and value is either a scalar value string or a File object.
@@ -12262,16 +12262,16 @@ function requireClientH2 () {
 	    if (request.onHeaders(Number(statusCode), parseH2Headers(realHeaders), stream.resume.bind(stream), '') === false) {
 	      stream.pause();
 	    }
-	  });
 
-	  stream.on('data', (chunk) => {
-	    if (request.aborted || request.completed) {
-	      return
-	    }
+	    stream.on('data', (chunk) => {
+	      if (request.aborted || request.completed) {
+	        return
+	      }
 
-	    if (request.onData(chunk) === false) {
-	      stream.pause();
-	    }
+	      if (request.onData(chunk) === false) {
+	        stream.pause();
+	      }
+	    });
 	  });
 
 	  stream.once('end', () => {
@@ -23122,8 +23122,16 @@ function requireCacheHandler () {
 	    staleIfError = staleAt + (cacheControlDirectives['stale-if-error'] * 1000);
 	  }
 
-	  if (staleWhileRevalidate === -Infinity && staleIfError === -Infinity) {
+	  if (cacheControlDirectives.immutable && staleWhileRevalidate === -Infinity && staleIfError === -Infinity) {
 	    immutable = now + 31536000000;
+	  }
+
+	  // When no stale directives or immutable flag, add a revalidation buffer
+	  // equal to the freshness lifetime so the entry survives past staleAt long
+	  // enough to be revalidated instead of silently disappearing.
+	  if (staleWhileRevalidate === -Infinity && staleIfError === -Infinity && immutable === -Infinity) {
+	    const freshnessLifetime = staleAt - now;
+	    return staleAt + freshnessLifetime
 	  }
 
 	  return Math.max(staleAt, staleWhileRevalidate, staleIfError, immutable)
@@ -30290,9 +30298,12 @@ function requireFetch () {
 	    /** @type {import('../../..').Agent} */
 	    const agent = fetchParams.controller.dispatcher;
 
+	    const path = url.pathname + url.search;
+	    const hasTrailingQuestionMark = url.search.length === 0 && url.href[url.href.length - url.hash.length - 1] === '?';
+
 	    return new Promise((resolve, reject) => agent.dispatch(
 	      {
-	        path: url.href.slice(url.origin.length, url.hash.length ? -url.hash.length : undefined),
+	        path: hasTrailingQuestionMark ? `${path}?` : path,
 	        origin: url.origin,
 	        method: request.method,
 	        body: agent.isMockActive ? request.body && (request.body.source || request.body.stream) : body,
@@ -33797,9 +33808,6 @@ function requirePermessageDeflate () {
 
 	  #options = {}
 
-	  /** @type {number} */
-	  #maxDecompressedSize
-
 	  /** @type {boolean} */
 	  #aborted = false
 
@@ -33808,12 +33816,10 @@ function requirePermessageDeflate () {
 
 	  /**
 	   * @param {Map<string, string>} extensions
-	   * @param {{ maxDecompressedMessageSize?: number }} [options]
 	   */
-	  constructor (extensions, options = {}) {
+	  constructor (extensions) {
 	    this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover');
 	    this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits');
-	    this.#maxDecompressedSize = options.maxDecompressedMessageSize ?? kDefaultMaxDecompressedSize;
 	  }
 
 	  decompress (chunk, fin, callback) {
@@ -33855,7 +33861,7 @@ function requirePermessageDeflate () {
 
 	        this.#inflate[kLength] += data.length;
 
-	        if (this.#inflate[kLength] > this.#maxDecompressedSize) {
+	        if (this.#inflate[kLength] > kDefaultMaxDecompressedSize) {
 	          this.#aborted = true;
 	          this.#inflate.removeAllListeners();
 	          this.#inflate.destroy();
@@ -33950,23 +33956,18 @@ function requireReceiver () {
 	  /** @type {import('./websocket').Handler} */
 	  #handler
 
-	  /** @type {{ maxDecompressedMessageSize?: number }} */
-	  #options
-
 	  /**
 	   * @param {import('./websocket').Handler} handler
 	   * @param {Map<string, string>|null} extensions
-	   * @param {{ maxDecompressedMessageSize?: number }} [options]
 	   */
-	  constructor (handler, extensions, options = {}) {
+	  constructor (handler, extensions) {
 	    super();
 
 	    this.#handler = handler;
 	    this.#extensions = extensions == null ? new Map() : extensions;
-	    this.#options = options;
 
 	    if (this.#extensions.has('permessage-deflate')) {
-	      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options));
+	      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions));
 	    }
 	  }
 
@@ -34600,8 +34601,6 @@ function requireWebsocket () {
 	  #binaryType
 	  /** @type {import('./receiver').ByteParser} */
 	  #parser
-	  /** @type {{ maxDecompressedMessageSize?: number }} */
-	  #options
 
 	  /**
 	   * @param {string} url
@@ -34646,11 +34645,6 @@ function requireWebsocket () {
 
 	    // 5. Set this's url to urlRecord.
 	    this.#url = new URL(urlRecord.href);
-
-	    // Store options for later use (e.g., maxDecompressedMessageSize)
-	    this.#options = {
-	      maxDecompressedMessageSize: options.maxDecompressedMessageSize
-	    };
 
 	    // 6. Let client be this's relevant settings object.
 	    const client = environmentSettingsObject.settingsObject;
@@ -34954,7 +34948,7 @@ function requireWebsocket () {
 	    // once this happens, the connection is open
 	    this.#handler.socket = response.socket;
 
-	    const parser = new ByteParser(this.#handler, parsedExtensions, this.#options);
+	    const parser = new ByteParser(this.#handler, parsedExtensions);
 	    parser.on('drain', () => this.#handler.onParserDrain());
 	    parser.on('error', (err) => this.#handler.onParserError(err));
 
@@ -35206,19 +35200,6 @@ function requireWebsocket () {
 	  {
 	    key: 'headers',
 	    converter: webidl.nullableConverter(webidl.converters.HeadersInit)
-	  },
-	  {
-	    key: 'maxDecompressedMessageSize',
-	    converter: webidl.nullableConverter((V) => {
-	      V = webidl.converters['unsigned long long'](V);
-	      if (V <= 0) {
-	        throw webidl.errors.exception({
-	          header: 'WebSocket constructor',
-	          message: 'maxDecompressedMessageSize must be greater than 0'
-	        })
-	      }
-	      return V
-	    })
 	  }
 	]);
 
