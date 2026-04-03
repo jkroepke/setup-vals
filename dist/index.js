@@ -20448,8 +20448,6 @@ function requireGlobal () {
 	const Agent = requireAgent();
 	const Dispatcher1Wrapper = requireDispatcher1Wrapper();
 
-	const nodeMajor = Number(process.versions.node.split('.', 1)[0]);
-
 	if (getGlobalDispatcher() === undefined) {
 	  setGlobalDispatcher(new Agent());
 	}
@@ -20466,16 +20464,14 @@ function requireGlobal () {
 	    configurable: false
 	  });
 
-	  if (nodeMajor === 22) {
-	    const legacyAgent = agent instanceof Dispatcher1Wrapper ? agent : new Dispatcher1Wrapper(agent);
+	  const legacyAgent = agent instanceof Dispatcher1Wrapper ? agent : new Dispatcher1Wrapper(agent);
 
-	    Object.defineProperty(globalThis, legacyGlobalDispatcher, {
-	      value: legacyAgent,
-	      writable: true,
-	      enumerable: false,
-	      configurable: false
-	    });
-	  }
+	  Object.defineProperty(globalThis, legacyGlobalDispatcher, {
+	    value: legacyAgent,
+	    writable: true,
+	    enumerable: false,
+	    configurable: false
+	  });
 	}
 
 	function getGlobalDispatcher () {
@@ -35809,12 +35805,6 @@ function requireWebsocketstream () {
 	    const readable = new ReadableStream({
 	      start: (controller) => {
 	        this.#readableStreamController = controller;
-	      },
-	      pull (controller) {
-	        let chunk;
-	        while (controller.desiredSize > 0 && (chunk = response.socket.read()) !== null) {
-	          controller.enqueue(chunk);
-	        }
 	      },
 	      cancel: (reason) => this.#cancel(reason)
 	    });
