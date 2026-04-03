@@ -85,7 +85,6 @@ jobs:
           VALIDATE_TYPESCRIPT_ES: false
           VALIDATE_JSON: false
           VALIDATE_MARKDOWN: false
-          VALIDATE_SPELL_CODESPELL: true
 
   release:
     if: github.repository_owner == 'jkroepke' && github.ref_name == 'main'
