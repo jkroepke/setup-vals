@@ -1,2 +1,2 @@
 [codespell]
-skip = .gitignore
+skip = .gitignore,package.json,package-lock.json
