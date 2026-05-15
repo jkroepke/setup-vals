@@ -10,7 +10,7 @@
     "@actions/core": "3.0.1",
     "@actions/http-client": "4.0.1",
     "@actions/tool-cache": "4.0.0",
-    "semver": "7.7.4"
+    "semver": "7.8.0"
   },
   "engines": {
     "node": ">=24.0.0"
@@ -62,6 +62,6 @@
     "@rollup/rollup-linux-x64-gnu": "4.60.4"
   },
   "overrides": {
-    "undici": "8.2.0"
+    "undici": "8.3.0"
   }
 }
