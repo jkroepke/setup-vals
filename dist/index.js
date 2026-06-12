@@ -2571,9 +2571,8 @@ function requireUtil$5 () {
 	}
 
 	function addAbortListener (signal, listener) {
-	  if (signal instanceof AbortSignal) {
-	    const disposable = addAbortListenerNative(signal, listener);
-	    return () => disposable[Symbol.dispose]()
+	  if (!signal || 'aborted' in signal) {
+	    return addAbortListenerNative(signal, listener)[Symbol.dispose]
 	  }
 
 	  if (typeof signal.addEventListener === 'function') {
@@ -2666,8 +2665,9 @@ function requireUtil$5 () {
 	 */
 	function parseRangeHeader (range) {
 	  if (range == null || range === '') return { start: 0, end: null, size: null }
+	  if (!range) return null
 
-	  const m = range ? range.match(rangeHeaderRegex) : null;
+	  const m = rangeHeaderRegex.exec(range);
 	  return m
 	    ? {
 	        start: parseInt(m[1]),
@@ -2816,8 +2816,10 @@ function requireUtil$5 () {
 	  return urlString.slice(0, urlString.indexOf(':') + 1)
 	}
 
-	const kEnumerableProperty = Object.create(null);
-	kEnumerableProperty.enumerable = true;
+	const kEnumerableProperty = {
+	  __proto__: null,
+	  enumerable: true
+	};
 
 	const normalizedMethodRecordsBase = {
 	  delete: 'DELETE',
@@ -3965,7 +3967,7 @@ function requireConnect () {
 	const net = require$$1$1;
 	const assert = require$$0$1;
 	const util = requireUtil$5();
-	const { InvalidArgumentError } = requireErrors();
+	const { InvalidArgumentError, ConnectTimeoutError } = requireErrors();
 
 	let tls; // include tls conditionally since it is not always available
 
@@ -4021,7 +4023,7 @@ function requireConnect () {
 	  }
 	};
 
-	function buildConnector ({ allowH2, useH2c, maxCachedSessions, socketPath, timeout, session: customSession, ...opts }) {
+	function buildConnector ({ allowH2, preferH2, useH2c, maxCachedSessions, socketPath, timeout, session: customSession, ...opts }) {
 	  if (maxCachedSessions != null && (!Number.isInteger(maxCachedSessions) || maxCachedSessions < 0)) {
 	    throw new InvalidArgumentError('maxCachedSessions must be a positive integer or zero')
 	  }
@@ -4051,7 +4053,7 @@ function requireConnect () {
 	        servername,
 	        session,
 	        localAddress,
-	        ALPNProtocols: allowH2 ? ['http/1.1', 'h2'] : ['http/1.1'],
+	        ALPNProtocols: allowH2 ? (preferH2 ? ['h2', 'http/1.1'] : ['http/1.1', 'h2']) : ['http/1.1'],
 	        socket: httpSocket, // upgrade socket connection
 	        port,
 	        host: hostname
@@ -4104,12 +4106,37 @@ function requireConnect () {
 	        if (callback) {
 	          const cb = callback;
 	          callback = null;
-	          cb(err);
+	          cb(maybeNormalizeConnectError(err, this, { timeout, hostname, port }));
 	        }
 	      });
 
 	    return socket
 	  }
+	}
+
+	// `net.connect` with `autoSelectFamily` raises an `AggregateError` when every
+	// attempted address fails. If any of those failures is a timeout, surface the
+	// error as a `ConnectTimeoutError` so callers see the same error regardless of
+	// which timer (Node's internal one or undici's `connectTimeout`) wins the race.
+	// The original `AggregateError` is preserved on `.cause`.
+	function maybeNormalizeConnectError (err, socket, opts) {
+	  if (
+	    err instanceof AggregateError &&
+	    (err.code === 'ETIMEDOUT' || err.errors.some((e) => e != null && e.code === 'ETIMEDOUT'))
+	  ) {
+	    let message = 'Connect Timeout Error';
+	    if (Array.isArray(socket.autoSelectFamilyAttemptedAddresses)) {
+	      message += ` (attempted addresses: ${socket.autoSelectFamilyAttemptedAddresses.join(', ')},`;
+	    } else {
+	      message += ` (attempted address: ${opts.hostname}:${opts.port},`;
+	    }
+	    message += ` timeout: ${opts.timeout}ms)`;
+
+	    const wrapped = new ConnectTimeoutError(message);
+	    wrapped.cause = err;
+	    return wrapped
+	  }
+	  return err
 	}
 
 	connect = buildConnector;
@@ -10214,7 +10241,6 @@ function requireClientH1 () {
 	  finish () {
 	    assert(currentParser === null);
 	    assert(this.ptr != null);
-	    assert(!this.paused);
 
 	    const { llhttp } = this;
 
@@ -11528,7 +11554,9 @@ function requireClientH2 () {
 	  RequestAbortedError,
 	  SocketError,
 	  InformationalError,
-	  InvalidArgumentError
+	  InvalidArgumentError,
+	  HeadersTimeoutError,
+	  BodyTimeoutError
 	} = requireErrors();
 	const {
 	  kUrl,
@@ -11553,6 +11581,7 @@ function requireClientH2 () {
 	  kSize,
 	  kHTTPContext,
 	  kClosed,
+	  kHeadersTimeout,
 	  kBodyTimeout,
 	  kEnableConnectProtocol,
 	  kRemoteSettings,
@@ -11601,6 +11630,29 @@ function requireClientH2 () {
 	      : new SocketError(`HTTP/2: "GOAWAY" frame received with code ${errorCode}`, util.getSocketInfo(session[kSocket])))
 	}
 
+	function resetHttp2Session (session, err) {
+	  const client = session[kClient];
+	  const socket = session[kSocket];
+
+	  if (client[kHTTP2Session] === session) {
+	    client[kSocket] = null;
+	    client[kHTTPContext] = null;
+	    client[kHTTP2Session] = null;
+	  }
+
+	  if (socket != null && socket[kError] == null) {
+	    socket[kError] = err;
+	  }
+
+	  if (!session.closed && !session.destroyed) {
+	    try {
+	      session.destroy(err);
+	    } catch {}
+	  }
+
+	  util.destroy(socket, err);
+	}
+
 	function getGoAwayPendingIdx (client, lastStreamID) {
 	  const maxAcceptedStreamID = Number.isInteger(lastStreamID) ? lastStreamID : Number.MAX_SAFE_INTEGER;
 
@@ -11640,6 +11692,10 @@ function requireClientH2 () {
 	  const stream = request[kRequestStream];
 	  detachRequestFromStream(request);
 	  cleanup?.(stream);
+	}
+
+	function requeueUnsentRequest (client, request) {
+	  client[kQueue].splice(client[kPendingIdx] + 1, 0, request);
 	}
 
 	function canRetryRequestAfterGoAway (request) {
@@ -12046,6 +12102,19 @@ function requireClientH2 () {
 	}
 
 	function onRequestStreamClose () {
+	  const state = this[kRequestStreamState];
+
+	  if (state) {
+	    // Release the stream first so request references are cleared,
+	    // then complete the response with trailers if available.
+	    releaseRequestStream(this);
+
+	    if (state.pendingEnd && !state.request.aborted && !state.request.completed) {
+	      state.request.onResponseEnd(state.trailers || {});
+	      state.finalizeRequest();
+	    }
+	  }
+
 	  this.off('data', onData);
 	  this.off('error', noop);
 	  closeStreamSession(this);
@@ -12149,7 +12218,7 @@ function requireClientH2 () {
 
 	function onUpgradeStreamTimeout () {
 	  const state = this[kRequestStreamState];
-	  failUpgradeStream(state, new InformationalError(`HTTP/2: "stream timeout after ${state.requestTimeout}"`));
+	  failUpgradeStream(state, new InformationalError(`HTTP/2: "stream timeout after ${state.headersTimeout}"`));
 	}
 
 	function onUpgradeResponse (headers, _flags) {
@@ -12174,7 +12243,7 @@ function requireClientH2 () {
 	}
 
 	function setupUpgradeStream (stream, state) {
-	  const { request, requestTimeout, session } = state;
+	  const { request, headersTimeout, session } = state;
 
 	  stream[kHTTP2Stream] = true;
 	  stream[kHTTP2Session] = session;
@@ -12189,11 +12258,12 @@ function requireClientH2 () {
 	  stream.once('close', onUpgradeStreamClose);
 
 	  ++session[kOpenStreams];
-	  stream.setTimeout(requestTimeout);
+	  stream.setTimeout(headersTimeout);
 	}
 
 	function writeH2 (client, request) {
-	  const requestTimeout = request.bodyTimeout ?? client[kBodyTimeout];
+	  const headersTimeout = request.headersTimeout ?? client[kHeadersTimeout];
+	  const bodyTimeout = request.bodyTimeout ?? client[kBodyTimeout];
 	  const session = client[kHTTP2Session];
 	  const { method, path, host, upgrade, expectContinue, signal, protocol, headers: reqHeaders } = request;
 	  let { body } = request;
@@ -12256,8 +12326,14 @@ function requireClientH2 () {
 	    try {
 	      return session.request(headers, options)
 	    } catch (err) {
-	      if (err?.code !== 'ERR_HTTP2_INVALID_CONNECTION_HEADERS') {
-	        throw err
+	      if (err?.code === 'ERR_HTTP2_INVALID_SESSION') {
+	        const wrappedErr = new SocketError(err.message, util.getSocketInfo(session[kSocket]));
+	        wrappedErr.cause = err;
+	        session[kError] = wrappedErr;
+	        resetHttp2Session(session, wrappedErr);
+	        requeueUnsentRequest(client, request);
+
+	        return null
 	      }
 
 	      const wrappedErr = new InformationalError(err.message, { cause: err });
@@ -12291,7 +12367,8 @@ function requireClientH2 () {
 	      abort,
 	      finalizeRequest,
 	      request,
-	      requestTimeout,
+	      headersTimeout,
+	      bodyTimeout,
 	      responseReceived: false,
 	      session,
 	      stream: null
@@ -12432,7 +12509,8 @@ function requireClientH2 () {
 	    expectsPayload,
 	    finalizeRequest,
 	    request,
-	    requestTimeout,
+	    headersTimeout,
+	    bodyTimeout,
 	    responseReceived: false,
 	    session,
 	    stream: null
@@ -12449,11 +12527,10 @@ function requireClientH2 () {
 	  stream[kHTTP2Stream] = true;
 	  stream[kRequestStreamState] = state;
 	  state.stream = stream;
-	  bindRequestToStream(request, stream, null);
 
 	  // Increment counter as we have new streams open
 	  ++session[kOpenStreams];
-	  stream.setTimeout(requestTimeout);
+	  stream.setTimeout(headersTimeout);
 
 	  stream[kHTTP2Session] = session;
 	  stream.once('close', onRequestStreamClose);
@@ -12537,6 +12614,7 @@ function requireClientH2 () {
 	  delete headers[HTTP2_HEADER_STATUS];
 	  request.onResponseStarted();
 	  state.responseReceived = true;
+	  stream.setTimeout(state.bodyTimeout);
 
 	  // Due to the stream nature, it is possible we face a race condition
 	  // where the stream has been assigned, but the request has been aborted
@@ -12562,14 +12640,14 @@ function requireClientH2 () {
 
 	  stream.off('end', onEnd);
 
-	  releaseRequestStream(stream);
-	  // If we received a response, this is a normal completion
+	  // If we received a response, this is a normal completion.
+	  // Defer actual completion to onRequestStreamClose so that
+	  // onTrailers (which may fire after 'end' on Windows) can
+	  // store trailers first.
 	  if (state.responseReceived) {
 	    if (!request.aborted && !request.completed) {
-	      request.onResponseEnd({});
+	      state.pendingEnd = true;
 	    }
-
-	    state.finalizeRequest();
 	  } else {
 	    // Stream ended without receiving a response - this is an error
 	    // (e.g., server destroyed the stream before sending headers)
@@ -12582,8 +12660,6 @@ function requireClientH2 () {
 	  const state = stream[kRequestStreamState];
 
 	  stream.off('error', onError);
-
-	  releaseRequestStream(stream);
 	  state.abort(err);
 	}
 
@@ -12592,8 +12668,6 @@ function requireClientH2 () {
 	  const state = stream[kRequestStreamState];
 
 	  stream.off('frameError', onFrameError);
-
-	  releaseRequestStream(stream);
 	  state.abort(new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`));
 	}
 
@@ -12605,9 +12679,12 @@ function requireClientH2 () {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
 
-	  releaseRequestStream(stream);
+	  // Remove self so timeout doesn't fire again after we handle it
+	  stream.off('timeout', onTimeout);
 
-	  const err = new InformationalError(`HTTP/2: "stream timeout after ${state.requestTimeout}"`);
+	  const err = state.responseReceived
+	    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${state.bodyTimeout}"`)
+	    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${state.headersTimeout}"`);
 	  state.abort(err);
 	}
 
@@ -12617,14 +12694,14 @@ function requireClientH2 () {
 	  const { request } = state;
 
 	  stream.off('trailers', onTrailers);
+	  stream.off('data', onData);
 
 	  if (request.aborted || request.completed) {
 	    return
 	  }
 
-	  releaseRequestStream(stream);
-	  request.onResponseEnd(trailers);
-	  state.finalizeRequest();
+	  // Store trailers for onRequestStreamClose to use when completing
+	  state.trailers = trailers;
 	}
 
 	function writeBodyH2 () {
@@ -12930,6 +13007,18 @@ function requireClient () {
 	  return client[kPipelining] ?? client[kHTTPContext]?.defaultPipelining ?? 1
 	}
 
+	// Protocol-aware dispatch ceiling. h1 RFC7230 pipelining is unrelated to h2
+	// stream multiplexing — over h2 the ceiling is the (server-confirmed)
+	// maxConcurrentStreams. Before a context is attached we use the h1
+	// pipelining factor; once h2 attaches the queued requests can drain in
+	// one batch up to maxConcurrentStreams.
+	function getMaxConcurrent (client) {
+	  if (client[kHTTPContext]?.version === 'h2') {
+	    return client[kMaxConcurrentStreams]
+	  }
+	  return getPipelining(client)
+	}
+
 	/**
 	 * @type {import('../../types/client.js').default}
 	 */
@@ -13180,10 +13269,17 @@ function requireClient () {
 	  }
 
 	  get [kBusy] () {
+	    // The `kPending > 0` check below is the gate Pool uses to decide whether
+	    // to spin up an additional Client. For h1 that fan-out is correct —
+	    // each socket only handles one pipelined request at a time. Once an h2
+	    // context is attached we want concurrent dispatches to multiplex onto
+	    // the shared session, so suppress that signal in the h2 case.
+	    const allowsMux = this[kHTTPContext]?.version === 'h2';
+
 	    return Boolean(
 	      this[kHTTPContext]?.busy(null) ||
-	      (this[kSize] >= (getPipelining(this) || 1)) ||
-	      this[kPending] > 0
+	      (this[kSize] >= (getMaxConcurrent(this) || 1)) ||
+	      (this[kPending] > 0 && !allowsMux)
 	    )
 	  }
 
@@ -13401,9 +13497,15 @@ function requireClient () {
 	  }
 
 	  if (err.code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
-	    assert(client[kRunning] === 0);
+	    const running = client[kQueue].splice(client[kRunningIdx], client[kRunning]);
+	    client[kPendingIdx] = client[kRunningIdx];
+
+	    for (let i = 0; i < running.length; i++) {
+	      util.errorRequest(client, running[i], err);
+	    }
+
 	    while (client[kPending] > 0 && client[kQueue][client[kPendingIdx]].servername === client[kServerName]) {
-	      const request = client[kQueue][client[kPendingIdx]++];
+	      const request = client[kQueue].splice(client[kPendingIdx], 1)[0];
 	      util.errorRequest(client, request, err);
 	    }
 	  } else {
@@ -13468,7 +13570,7 @@ function requireClient () {
 	      return
 	    }
 
-	    if (client[kRunning] >= (getPipelining(client) || 1)) {
+	    if (client[kRunning] >= (getMaxConcurrent(client) || 1)) {
 	      return
 	    }
 
@@ -19323,7 +19425,7 @@ function requireMockCallHistory () {
 	}
 
 	function makeFilterCalls (parameterName) {
-	  return (parameterValue, logs) => {
+	  return (parameterValue, logs = this.logs) => {
 	    if (typeof parameterValue === 'string' || parameterValue == null) {
 	      return logs.filter((log) => {
 	        return log[parameterName] === parameterValue
@@ -21062,7 +21164,15 @@ function requireSnapshotAgent () {
 	   * @returns {Promise<void>}
 	   */
 	  async close () {
-	    await this[kSnapshotRecorder].close();
+	    // In playback mode the recorder must not persist to disk. findSnapshot()
+	    // mutates each matched snapshot's callCount, so saving on close would
+	    // rewrite the snapshot file even though nothing new was recorded. Only
+	    // record/update modes should write snapshots; playback just cleans up.
+	    if (this[kSnapshotMode] === 'playback') {
+	      this[kSnapshotRecorder].destroy();
+	    } else {
+	      await this[kSnapshotRecorder].close();
+	    }
 	    await this[kRealAgent]?.close();
 	    await super.close();
 	  }
@@ -21252,9 +21362,11 @@ function requireRedirectHandler () {
 
 	    this.dispatch = dispatch;
 	    this.location = null;
-	    const { maxRedirections: _, ...cleanOpts } = opts;
+	    const { maxRedirections: _, stripHeadersOnRedirect, stripHeadersOnCrossOriginRedirect, ...cleanOpts } = opts;
 	    this.opts = cleanOpts; // opts must be a copy, exclude maxRedirections
 	    this.opts.body = util.wrapRequestBody(this.opts.body);
+	    this.stripHeadersOnRedirect = normalizeStripHeaders(stripHeadersOnRedirect, 'stripHeadersOnRedirect');
+	    this.stripHeadersOnCrossOriginRedirect = normalizeStripHeaders(stripHeadersOnCrossOriginRedirect, 'stripHeadersOnCrossOriginRedirect');
 	    this.maxRedirections = maxRedirections;
 	    this.handler = handler;
 	    this.history = [];
@@ -21323,7 +21435,7 @@ function requireRedirectHandler () {
 	    // Remove headers referring to the original URL.
 	    // By default it is Host only, unless it's a 303 (see below), which removes also all Content-* headers.
 	    // https://tools.ietf.org/html/rfc7231#section-6.4
-	    this.opts.headers = cleanRequestHeaders(this.opts.headers, statusCode === 303, this.opts.origin !== origin);
+	    this.opts.headers = cleanRequestHeaders(this.opts.headers, statusCode === 303, this.opts.origin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect);
 	    this.opts.path = path;
 	    this.opts.origin = origin;
 	    this.opts.query = null;
@@ -21357,26 +21469,49 @@ function requireRedirectHandler () {
 	}
 
 	// https://tools.ietf.org/html/rfc7231#section-6.4.4
-	function shouldRemoveHeader (header, removeContent, unknownOrigin) {
-	  if (header.length === 4) {
-	    return util.headerNameToString(header) === 'host'
-	  }
-	  if (removeContent && util.headerNameToString(header).startsWith('content-')) {
+	function shouldRemoveHeader (header, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin) {
+	  const name = util.headerNameToString(header);
+	  if (name === 'host') {
 	    return true
 	  }
-	  if (unknownOrigin && (header.length === 13 || header.length === 6 || header.length === 19)) {
-	    const name = util.headerNameToString(header);
+	  if (stripHeaders?.has(name) || (unknownOrigin && stripHeadersOnCrossOrigin?.has(name))) {
+	    return true
+	  }
+	  if (removeContent && name.startsWith('content-')) {
+	    return true
+	  }
+	  if (unknownOrigin) {
 	    return name === 'authorization' || name === 'cookie' || name === 'proxy-authorization'
 	  }
 	  return false
 	}
 
 	// https://tools.ietf.org/html/rfc7231#section-6.4
-	function cleanRequestHeaders (headers, removeContent, unknownOrigin) {
+	function normalizeStripHeaders (headers, optionName) {
+	  if (headers == null) {
+	    return null
+	  }
+
+	  if (!Array.isArray(headers)) {
+	    throw new InvalidArgumentError(`${optionName} must be an array`)
+	  }
+
+	  const normalized = new Set();
+	  for (const header of headers) {
+	    if (typeof header !== 'string') {
+	      throw new InvalidArgumentError(`${optionName} must contain header names`)
+	    }
+
+	    normalized.add(util.headerNameToString(header));
+	  }
+	  return normalized
+	}
+
+	function cleanRequestHeaders (headers, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin) {
 	  const ret = [];
 	  if (Array.isArray(headers)) {
 	    for (let i = 0; i < headers.length; i += 2) {
-	      if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin)) {
+	      if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
 	        ret.push(headers[i], headers[i + 1]);
 	      }
 	    }
@@ -21384,7 +21519,7 @@ function requireRedirectHandler () {
 	    const entries = util.hasSafeIterator(headers) ? headers : Object.entries(headers);
 
 	    for (const [key, value] of entries) {
-	      if (!shouldRemoveHeader(key, removeContent, unknownOrigin)) {
+	      if (!shouldRemoveHeader(key, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
 	        ret.push(key, value);
 	      }
 	    }
@@ -21407,16 +21542,16 @@ function requireRedirect () {
 
 	const RedirectHandler = requireRedirectHandler();
 
-	function createRedirectInterceptor ({ maxRedirections: defaultMaxRedirections, throwOnMaxRedirect: defaultThrowOnMaxRedirect } = {}) {
+	function createRedirectInterceptor ({ maxRedirections: defaultMaxRedirections, throwOnMaxRedirect: defaultThrowOnMaxRedirect, stripHeadersOnRedirect: defaultStripHeadersOnRedirect, stripHeadersOnCrossOriginRedirect: defaultStripHeadersOnCrossOriginRedirect } = {}) {
 	  return (dispatch) => {
 	    return function Intercept (opts, handler) {
-	      const { maxRedirections = defaultMaxRedirections, throwOnMaxRedirect = defaultThrowOnMaxRedirect, ...rest } = opts;
+	      const { maxRedirections = defaultMaxRedirections, throwOnMaxRedirect = defaultThrowOnMaxRedirect, stripHeadersOnRedirect = defaultStripHeadersOnRedirect, stripHeadersOnCrossOriginRedirect = defaultStripHeadersOnCrossOriginRedirect, ...rest } = opts;
 
 	      if (maxRedirections == null || maxRedirections === 0) {
 	        return dispatch(opts, handler)
 	      }
 
-	      const dispatchOpts = { ...rest, throwOnMaxRedirect }; // Stop sub dispatcher from also redirecting.
+	      const dispatchOpts = { ...rest, throwOnMaxRedirect, stripHeadersOnRedirect, stripHeadersOnCrossOriginRedirect }; // Stop sub dispatcher from also redirecting.
 	      const redirectHandler = new RedirectHandler(dispatch, maxRedirections, dispatchOpts, handler);
 	      return dispatch(dispatchOpts, redirectHandler)
 	    }
@@ -22219,6 +22354,10 @@ function requireDns () {
 
 	  return dispatch => {
 	    return function dnsInterceptor (origDispatchOpts, handler) {
+	      if (origDispatchOpts.origin == null) {
+	        return dispatch(origDispatchOpts, handler)
+	      }
+
 	      const origin =
 	        origDispatchOpts.origin.constructor === URL
 	          ? origDispatchOpts.origin
@@ -27652,6 +27791,13 @@ function requireRequest () {
 
 	  #state
 
+	  /**
+	   * Removes the `abort` listener that makes this request's signal follow the
+	   * passed signal. `null` when no such listener was registered.
+	   * @type {(() => void) | null}
+	   */
+	  #abortCleanup = null
+
 	  // https://fetch.spec.whatwg.org/#dom-request
 	  constructor (input, init = undefined) {
 	    webidl.util.markAsUncloneable(this);
@@ -27991,12 +28137,23 @@ function requireRequest () {
 	          setMaxListeners(1500, signal);
 	        }
 
-	        util.addAbortListener(signal, abort);
+	        const removeAbortListener = util.addAbortListener(signal, abort);
 	        // The third argument must be a registry key to be unregistered.
 	        // Without it, you cannot unregister.
 	        // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/FinalizationRegistry
 	        // abort is used as the unregister key. (because it is unique)
 	        requestFinalizer.register(ac, { signal, abort }, abort);
+
+	        // Allow the listener to be removed deterministically once the fetch
+	        // that owns this request has settled, instead of relying solely on the
+	        // FinalizationRegistry (i.e. garbage collection). Reusing a single
+	        // signal across many requests would otherwise leak listeners.
+	        // See https://github.com/nodejs/undici/issues/5285
+	        this.#abortCleanup = () => {
+	          requestFinalizer.unregister(abort);
+	          removeAbortListener();
+	          this.#abortCleanup = null;
+	        };
 	      }
 	    }
 
@@ -28423,15 +28580,25 @@ function requireRequest () {
 	  static setRequestState (request, newState) {
 	    request.#state = newState;
 	  }
+
+	  /**
+	   * Removes the `abort` listener that makes this request's signal follow the
+	   * signal passed to its constructor, if any. Idempotent.
+	   * @param {Request} request
+	   */
+	  static removeRequestAbortListener (request) {
+	    request.#abortCleanup?.();
+	  }
 	}
 
-	const { setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState } = Request;
+	const { setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState, removeRequestAbortListener } = Request;
 	Reflect.deleteProperty(Request, 'setRequestSignal');
 	Reflect.deleteProperty(Request, 'getRequestDispatcher');
 	Reflect.deleteProperty(Request, 'setRequestDispatcher');
 	Reflect.deleteProperty(Request, 'setRequestHeaders');
 	Reflect.deleteProperty(Request, 'getRequestState');
 	Reflect.deleteProperty(Request, 'setRequestState');
+	Reflect.deleteProperty(Request, 'removeRequestAbortListener');
 
 	mixinBody(Request, getRequestState);
 
@@ -28666,7 +28833,8 @@ function requireRequest () {
 	  fromInnerRequest,
 	  cloneRequest,
 	  getRequestDispatcher,
-	  getRequestState
+	  getRequestState,
+	  removeRequestAbortListener
 	};
 	return request;
 }
@@ -29002,7 +29170,7 @@ function requireFetch () {
 	  getResponseState
 	} = requireResponse();
 	const { HeadersList } = requireHeaders();
-	const { Request, cloneRequest, getRequestDispatcher, getRequestState } = requireRequest();
+	const { Request, cloneRequest, getRequestDispatcher, getRequestState, removeRequestAbortListener } = requireRequest();
 	const zlib = require$$0$5;
 	const {
 	  makePolicyContainer,
@@ -29199,7 +29367,7 @@ function requireFetch () {
 	  let controller = null;
 
 	  // 11. Add the following abort steps to requestObject’s signal:
-	  addAbortListener(
+	  const removeAbortListener = addAbortListener(
 	    requestObject.signal,
 	    () => {
 	      // 1. Set locallyAborted to true.
@@ -29218,6 +29386,15 @@ function requireFetch () {
 	      abortFetch(p, request, realResponse, requestObject.signal.reason, controller.controller);
 	    }
 	  );
+
+	  // Remove the `abort` listeners registered above and in the Request
+	  // constructor once the fetch has settled. Without this, reusing a single
+	  // signal across many requests leaks listeners and Node.js emits a
+	  // MaxListenersExceededWarning. See https://github.com/nodejs/undici/issues/5285
+	  const cleanupAbortListeners = () => {
+	    removeAbortListener();
+	    removeRequestAbortListener(requestObject);
+	  };
 
 	  // 12. Let handleFetchDone given response response be to finalize and
 	  // report timing with response, globalObject, and "fetch".
@@ -29243,6 +29420,7 @@ function requireFetch () {
 	      //    deserializedError.
 
 	      abortFetch(p, request, responseObject, controller.serializedAbortReason, controller.controller);
+	      cleanupAbortListeners();
 	      return
 	    }
 
@@ -29250,6 +29428,7 @@ function requireFetch () {
 	    // and terminate these substeps.
 	    if (response.type === 'error') {
 	      p.reject(new TypeError('fetch failed', { cause: response.error }));
+	      cleanupAbortListeners();
 	      return
 	    }
 
@@ -29264,7 +29443,10 @@ function requireFetch () {
 
 	  controller = fetching({
 	    request,
-	    processResponseEndOfBody: handleFetchDone,
+	    processResponseEndOfBody: (response) => {
+	      handleFetchDone(response);
+	      cleanupAbortListeners();
+	    },
 	    processResponse,
 	    dispatcher: getRequestDispatcher(requestObject), // undici
 	    // Keep requestObject alive to prevent its AbortController from being GC'd
@@ -41435,6 +41617,11 @@ function requireRange () {
 
 	const isX = id => !id || id.toLowerCase() === 'x' || id === '*';
 
+	const invalidXRangeOrder = (M, m, p) => (
+	  (isX(M) && !isX(m)) ||
+	  (isX(m) && p && !isX(p))
+	);
+
 	// ~, ~> --> * (any, kinda silly)
 	// ~2, ~2.x, ~2.x.x, ~>2, ~>2.x ~>2.x.x --> >=2.0.0 <3.0.0-0
 	// ~2.0, ~2.0.x, ~>2.0, ~>2.0.x --> >=2.0.0 <2.1.0-0
@@ -41531,10 +41718,10 @@ function requireRange () {
 	      if (M === '0') {
 	        if (m === '0') {
 	          ret = `>=${M}.${m}.${p
-	          }${z} <${M}.${m}.${+p + 1}-0`;
+	          } <${M}.${m}.${+p + 1}-0`;
 	        } else {
 	          ret = `>=${M}.${m}.${p
-	          }${z} <${M}.${+m + 1}.0-0`;
+	          } <${M}.${+m + 1}.0-0`;
 	        }
 	      } else {
 	        ret = `>=${M}.${m}.${p
@@ -41560,6 +41747,10 @@ function requireRange () {
 	  const r = options.loose ? re[t.XRANGELOOSE] : re[t.XRANGE];
 	  return comp.replace(r, (ret, gtlt, M, m, p, pr) => {
 	    debug('xRange', comp, ret, gtlt, M, m, p, pr);
+	    if (invalidXRangeOrder(M, m, p)) {
+	      return comp
+	    }
+
 	    const xM = isX(M);
 	    const xm = xM || isX(m);
 	    const xp = xm || isX(p);
