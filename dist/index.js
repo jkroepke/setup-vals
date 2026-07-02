@@ -1495,6 +1495,25 @@ function requireErrors () {
 	  }
 	}
 
+	const kProxyConnectionError = Symbol.for('undici.error.UND_ERR_PRX_CONN');
+	class ProxyConnectionError extends UndiciError {
+	  constructor (cause, message, options = {}) {
+	    super(message, { cause, ...options });
+	    this.name = 'ProxyConnectionError';
+	    this.message = message || 'Proxy Connection failed';
+	    this.code = 'UND_ERR_PRX_CONN';
+	    this.cause = cause;
+	  }
+
+	  static [Symbol.hasInstance] (instance) {
+	    return instance && instance[kProxyConnectionError] === true
+	  }
+
+	  get [kProxyConnectionError] () {
+	    return true
+	  }
+	}
+
 	const kMaxOriginsReachedError = Symbol.for('undici.error.UND_ERR_MAX_ORIGINS_REACHED');
 	class MaxOriginsReachedError extends UndiciError {
 	  constructor (message) {
@@ -1563,6 +1582,7 @@ function requireErrors () {
 	  RequestRetryError,
 	  ResponseError,
 	  SecureProxyConnectionError,
+	  ProxyConnectionError,
 	  MaxOriginsReachedError,
 	  Socks5ProxyError,
 	  MessageSizeExceededError
@@ -2833,7 +2853,9 @@ function requireUtil$5 () {
 	  post: 'POST',
 	  POST: 'POST',
 	  put: 'PUT',
-	  PUT: 'PUT'
+	  PUT: 'PUT',
+	  query: 'QUERY',
+	  QUERY: 'QUERY'
 	};
 
 	const normalizedMethodRecords = {
@@ -3402,7 +3424,7 @@ function requireRequest$1 () {
 	    this.protocol = getProtocolFromUrlString(origin);
 
 	    this.idempotent = idempotent == null
-	      ? method === 'HEAD' || method === 'GET'
+	      ? method === 'HEAD' || method === 'GET' || method === 'QUERY'
 	      : idempotent;
 
 	    this.blocking = blocking ?? this.method !== 'HEAD';
@@ -4816,7 +4838,7 @@ function requireConstants$3 () {
 
 	const requestRedirect = /** @type {const} */ (['follow', 'manual', 'error']);
 
-	const safeMethods = /** @type {const} */ (['GET', 'HEAD', 'OPTIONS', 'TRACE']);
+	const safeMethods = /** @type {const} */ (['GET', 'HEAD', 'OPTIONS', 'TRACE', 'QUERY']);
 	const safeMethodsSet = new Set(safeMethods);
 
 	const requestMode = /** @type {const} */ (['navigate', 'same-origin', 'no-cors', 'cors']);
@@ -10291,6 +10313,29 @@ function requireClientH1 () {
 
 	    const { llhttp } = this;
 
+	    // The peer closed the connection. If the body parser was paused by
+	    // backpressure we must finish parsing before signalling EOF, otherwise
+	    // llhttp_finish() would crash (it used to assert !paused) or report a
+	    // half-parsed message. Backpressure is advisory here: onData keeps buffering
+	    // delivered bytes into the response stream, so resume across pauses and
+	    // drain whatever is still buffered on the socket. A Content-Length/chunked
+	    // body reaches on_message_complete during execute(); an EOF-delimited body
+	    // stays paused (its length is unknown) and is completed by llhttp_finish().
+	    if (this.paused) {
+	      let data;
+	      do {
+	        llhttp.llhttp_resume(this.ptr);
+	        this.paused = false;
+	        data = this.socket.read() || EMPTY_BUF;
+	        this.execute(data);
+	      } while (this.paused && data.length > 0)
+
+	      if (this.paused) {
+	        llhttp.llhttp_resume(this.ptr);
+	        this.paused = false;
+	      }
+	    }
+
 	    let ret;
 
 	    try {
@@ -11832,16 +11877,20 @@ function requireClientH2 () {
 	  return body == null || util.isBuffer(body) || util.isBlobLike(body)
 	}
 
-	function closeRequestStream (request, code = NGHTTP2_REFUSED_STREAM) {
-	  const stream = request[kRequestStream];
-
-	  clearRequestStream(request);
-
+	function closeStream (stream, code = NGHTTP2_REFUSED_STREAM) {
 	  if (stream != null && !stream.destroyed && !stream.closed) {
 	    try {
 	      stream.close(code);
 	    } catch {}
 	  }
+	}
+
+	function detachRequestStreamForClose (request) {
+	  const stream = request[kRequestStream];
+
+	  clearRequestStream(request);
+
+	  return stream
 	}
 
 	function connectH2 (client, socket) {
@@ -12105,11 +12154,20 @@ function requireClientH2 () {
 	  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
 
 	  this[kSocket][kError] = err;
+
+	  if (this[kReceivedGoAway]) {
+	    return
+	  }
+
 	  this[kClient][kOnError](err);
 	}
 
 	function onHttp2FrameError (type, code, id) {
 	  if (id === 0) {
+	    if (this[kReceivedGoAway]) {
+	      return
+	    }
+
 	    const err = new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`);
 	    this[kSocket][kError] = err;
 	    this[kClient][kOnError](err);
@@ -12143,12 +12201,16 @@ function requireClientH2 () {
 	  const previousPendingIdx = client[kPendingIdx];
 	  const pendingIdx = getGoAwayPendingIdx(client, lastStreamID);
 	  const retriableRequests = [];
+	  const streamsToClose = [];
 
+	  // Closing one stream after GOAWAY can synchronously emit frameError on
+	  // sibling streams. Detach all affected requests first so those errors do
+	  // not fail requests that are about to be requeued.
 	  for (let i = pendingIdx; i < previousPendingIdx; i++) {
 	    const request = client[kQueue][i];
 
 	    if (request != null) {
-	      closeRequestStream(request);
+	      streamsToClose.push(detachRequestStreamForClose(request));
 
 	      if (canRetryRequestAfterGoAway(request)) {
 	        retriableRequests.push(request);
@@ -12156,6 +12218,10 @@ function requireClientH2 () {
 	        util.errorRequest(client, request, err);
 	      }
 	    }
+	  }
+
+	  for (let i = 0; i < streamsToClose.length; i++) {
+	    closeStream(streamsToClose[i]);
 	  }
 
 	  if (pendingIdx !== previousPendingIdx) {
@@ -12252,6 +12318,10 @@ function requireClientH2 () {
 	  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID');
 
 	  this[kError] = err;
+
+	  if (this[kHTTP2Session]?.[kReceivedGoAway]) {
+	    return
+	  }
 
 	  this[kClient][kOnError](err);
 	}
@@ -12695,6 +12765,7 @@ function requireClientH2 () {
 	    headersTimeout,
 	    bodyTimeout,
 	    responseReceived: false,
+	    bodySent: false,
 	    session,
 	    stream: null
 	  };
@@ -12794,6 +12865,13 @@ function requireClientH2 () {
 
 	  stream.off('response', onResponse);
 
+	  // Final response received while still awaiting 100 (Continue): the body won't
+	  // be sent, so close our half or the stream stays open and never completes.
+	  if (state.body != null && !state.bodySent && !stream.writableEnded) {
+	    stream.removeListener('continue', writeBodyH2);
+	    stream.end();
+	  }
+
 	  const statusCode = headers[HTTP2_HEADER_STATUS];
 	  delete headers[HTTP2_HEADER_STATUS];
 	  request.onResponseStarted();
@@ -12891,6 +12969,7 @@ function requireClientH2 () {
 	function writeBodyH2 () {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
+	  state.bodySent = true;
 	  const { abort, body, client, contentLength, expectsPayload, request } = state;
 
 	  if (!body || contentLength === 0) {
@@ -15962,7 +16041,7 @@ function requireProxyAgent () {
 	const Agent = requireAgent();
 	const Pool = requirePool();
 	const DispatcherBase = requireDispatcherBase();
-	const { InvalidArgumentError, RequestAbortedError, SecureProxyConnectionError } = requireErrors();
+	const { InvalidArgumentError, RequestAbortedError, SecureProxyConnectionError, ProxyConnectionError } = requireErrors();
 	const buildConnector = requireConnect();
 	const Client = requireClient();
 	const { channels } = requireDiagnostics();
@@ -16189,6 +16268,14 @@ function requireProxyAgent () {
 	          if (err.code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
 	            // Throw a custom error to avoid loop in client.js#connect
 	            callback(new SecureProxyConnectionError(err));
+	          } else if (err.code === 'UND_ERR_SOCKET') {
+	            // A socket failure while establishing the tunnel means the CONNECT
+	            // never completed, so there is nothing to recover - the proxy just
+	            // tore down the connection. client.js#onError treats UND_ERR_SOCKET
+	            // as a recoverable error on an established connection and leaves the
+	            // request queued, which makes connect() retry forever. Surface it as
+	            // a non-recoverable proxy error so the request fails instead. (#3897)
+	            callback(new ProxyConnectionError(err));
 	          } else {
 	            callback(err);
 	          }
@@ -16478,6 +16565,28 @@ function requireRetryHandler () {
 	  return isNaN(retryTime) ? 0 : retryTime - Date.now()
 	}
 
+	// A stable controller handed to the downstream handler for the lifetime of the
+	// request. Each transparent retry/resume is a *separate* dispatch with its
+	// *own* connection controller. Without a stable proxy the downstream body keeps
+	// flow-controlling the original (now-dead) controller while data flows on the
+	// new one: backpressure pauses the new connection's controller, but the
+	// consumer's resume() targets the old one, so the resumed body stalls forever.
+	// The proxy always forwards to the controller of the currently active connection.
+	class RetryController {
+	  constructor () {
+	    this.target = null;
+	  }
+
+	  pause () { this.target?.pause(); }
+	  resume () { this.target?.resume(); }
+	  abort (reason) { this.target?.abort(reason); }
+	  get paused () { return this.target?.paused ?? false }
+	  get aborted () { return this.target?.aborted ?? false }
+	  get reason () { return this.target?.reason ?? null }
+	  get rawHeaders () { return this.target?.rawHeaders ?? null }
+	  get rawTrailers () { return this.target?.rawTrailers ?? null }
+	}
+
 	class RetryHandler {
 	  constructor (opts, { dispatch, handler }) {
 	    const { retryOptions, ...dispatchOpts } = opts;
@@ -16509,7 +16618,7 @@ function requireRetryHandler () {
 	      timeoutFactor: timeoutFactor ?? 2,
 	      maxRetries: maxRetries ?? 5,
 	      // What errors we should retry
-	      methods: methods ?? ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE'],
+	      methods: methods ?? ['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE', 'QUERY'],
 	      // Indicates which errors to retry
 	      statusCodes: statusCodes ?? [500, 502, 503, 504, 429],
 	      // List of errors to retry
@@ -16534,6 +16643,7 @@ function requireRetryHandler () {
 	    this.etag = null;
 	    this.statusCode = null;
 	    this.headers = null;
+	    this.controllerProxy = new RetryController();
 	  }
 
 	  onResponseStartWithRetry (controller, statusCode, headers, statusMessage, err) {
@@ -16541,7 +16651,7 @@ function requireRetryHandler () {
 	      // Preserve old behavior for status codes that are not eligible for retry
 	      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
 	        this.headersSent = true;
-	        this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+	        this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage);
 	      } else {
 	        this.error = err;
 	      }
@@ -16551,14 +16661,14 @@ function requireRetryHandler () {
 
 	    if (isDisturbed(this.opts.body)) {
 	      this.headersSent = true;
-	      this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+	      this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage);
 	      return
 	    }
 
 	    function shouldRetry (passedErr) {
 	      if (passedErr) {
 	        this.headersSent = true;
-	        this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+	        this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage);
 	        controller.resume();
 	        return
 	      }
@@ -16567,6 +16677,13 @@ function requireRetryHandler () {
 	      controller.resume();
 	    }
 
+	    // The pause()/resume() pair (here and in shouldRetry) acts on THIS
+	    // connection's controller -- never the downstream proxy. We hold this exact
+	    // connection while the retry policy decides (possibly after a timeout) and
+	    // must resume the same one. Routing this through controllerProxy would risk
+	    // resuming a different connection if a later dispatch re-points the proxy in
+	    // between, leaving this one paused forever -- the very stall the proxy exists
+	    // to prevent.
 	    controller.pause();
 	    this.retryOpts.retry(
 	      err,
@@ -16579,13 +16696,19 @@ function requireRetryHandler () {
 	  }
 
 	  onRequestStart (controller, context) {
+	    // request.js creates a fresh RequestController per dispatch and passes that
+	    // same instance to every later callback of the dispatch. onRequestStart is
+	    // the first callback (it is where the controller is created), so re-pointing
+	    // the proxy here is enough to keep it on the active connection across every
+	    // transparent retry/resume.
+	    this.controllerProxy.target = controller;
 	    if (!this.headersSent) {
-	      this.handler.onRequestStart?.(controller, context);
+	      this.handler.onRequestStart?.(this.controllerProxy, context);
 	    }
 	  }
 
-	  onRequestUpgrade (controller, statusCode, headers, socket) {
-	    this.handler.onRequestUpgrade?.(controller, statusCode, headers, socket);
+	  onRequestUpgrade (_controller, statusCode, headers, socket) {
+	    this.handler.onRequestUpgrade?.(this.controllerProxy, statusCode, headers, socket);
 	  }
 
 	  static [kRetryHandlerDefaultRetry] (err, { state, opts }, cb) {
@@ -16712,7 +16835,7 @@ function requireRetryHandler () {
 	        if (range == null) {
 	          this.headersSent = true;
 	          this.handler.onResponseStart?.(
-	            controller,
+	            this.controllerProxy,
 	            statusCode,
 	            headers,
 	            statusMessage
@@ -16759,7 +16882,7 @@ function requireRetryHandler () {
 
 	      this.headersSent = true;
 	      this.handler.onResponseStart?.(
-	        controller,
+	        this.controllerProxy,
 	        statusCode,
 	        headers,
 	        statusMessage
@@ -16772,17 +16895,17 @@ function requireRetryHandler () {
 	    }
 	  }
 
-	  onResponseData (controller, chunk) {
+	  onResponseData (_controller, chunk) {
 	    if (this.error) {
 	      return
 	    }
 
 	    this.start += chunk.length;
 
-	    this.handler.onResponseData?.(controller, chunk);
+	    this.handler.onResponseData?.(this.controllerProxy, chunk);
 	  }
 
-	  onResponseEnd (controller, trailers) {
+	  onResponseEnd (_controller, trailers) {
 	    if (this.error && this.retryOpts.throwOnError) {
 	      throw this.error
 	    }
@@ -16799,13 +16922,13 @@ function requireRetryHandler () {
 	        }
 	      }
 	      this.retryCount = 0;
-	      return this.handler.onResponseEnd?.(controller, trailers)
+	      return this.handler.onResponseEnd?.(this.controllerProxy, trailers)
 	    }
 
-	    this.retry(controller);
+	    this.retry();
 	  }
 
-	  retry (controller) {
+	  retry () {
 	    if (this.start !== 0) {
 	      const headers = { range: `bytes=${this.start}-${this.end ?? ''}` };
 
@@ -16827,23 +16950,25 @@ function requireRetryHandler () {
 	      this.retryCountCheckpoint = this.retryCount;
 	      this.dispatch(this.opts, this);
 	    } catch (err) {
-	      this.handler.onResponseError?.(controller, err);
+	      this.handler.onResponseError?.(this.controllerProxy, err);
 	    }
 	  }
 
 	  onResponseError (controller, err) {
+	    // controller is THIS failed connection (not the proxy): we inspect whether
+	    // the consumer aborted it to decide retry-vs-propagate.
 	    if (controller?.aborted || isDisturbed(this.opts.body)) {
-	      this.handler.onResponseError?.(controller, err);
+	      this.handler.onResponseError?.(this.controllerProxy, err);
 	      return
 	    }
 
 	    function shouldRetry (returnedErr) {
 	      if (!returnedErr) {
-	        this.retry(controller);
+	        this.retry();
 	        return
 	      }
 
-	      this.handler?.onResponseError?.(controller, returnedErr);
+	      this.handler?.onResponseError?.(this.controllerProxy, returnedErr);
 	    }
 
 	    // We reconcile in case of a mix between network errors
@@ -17000,6 +17125,7 @@ function requireReadable () {
 	const kContentLength = Symbol('kContentLength');
 	const kUsed = Symbol('kUsed');
 	const kBytesRead = Symbol('kBytesRead');
+	const kPreservedBuffer = Symbol('kPreservedBuffer');
 
 	const noop = () => {};
 
@@ -17310,7 +17436,37 @@ function requireReadable () {
 	   */
 	  setEncoding (encoding) {
 	    if (Buffer.isEncoding(encoding)) {
-	      this._readableState.encoding = encoding;
+	      // Preserve raw Buffer chunks for the consume path (body.text(),
+	      // body.json(), etc.) before super.setEncoding() replaces them
+	      // with decoded strings. Without this, the consume path would
+	      // lose access to the original bytes — some of which may be held
+	      // by the decoder for incomplete multi-byte sequences, and the
+	      // rest converted to strings that can't be safely concatenated
+	      // byte-wise.
+	      const state = this._readableState;
+	      const buffer = state.buffer;
+	      if (buffer && state.length > 0) {
+	        const bufferIndex = state.bufferIndex ?? 0;
+	        const preserved = [];
+	        const source = typeof buffer.slice === 'function'
+	          ? buffer.slice(bufferIndex)
+	          : buffer;
+	        for (const data of source) {
+	          if (Buffer.isBuffer(data)) {
+	            preserved.push(data);
+	          }
+	        }
+	        if (preserved.length > 0) {
+	          this[kPreservedBuffer] = (this[kPreservedBuffer] || []).concat(preserved);
+	        }
+	      }
+
+	      // Delegate to Node.js Readable.setEncoding() which initializes a
+	      // StringDecoder and re-encodes already-buffered chunks. This properly
+	      // handles multi-byte sequences split at chunk boundaries for the
+	      // for-await / on('data') paths. Without this, Node.js uses
+	      // buf.toString(encoding) on each chunk, producing U+FFFD for split chars.
+	      super.setEncoding(encoding);
 	    }
 	    return this
 	  }
@@ -17418,7 +17574,17 @@ function requireReadable () {
 
 	  const { _readableState: state } = consume.stream;
 
-	  if (state.bufferIndex) {
+	  // If setEncoding() was called, state.buffer may contain decoded strings
+	  // (which would break Buffer.concat in chunksDecode). Use the preserved
+	  // raw Buffers (saved before super.setEncoding() in setEncoding()) for
+	  // byte-level accurate consumption. Otherwise read from state.buffer.
+	  const preserved = consume.stream[kPreservedBuffer];
+	  if (preserved && preserved.length > 0) {
+	    for (const chunk of preserved) {
+	      consumePush(consume, chunk);
+	    }
+	    consume.stream[kPreservedBuffer] = null;
+	  } else if (state.bufferIndex) {
 	    const start = state.bufferIndex;
 	    const end = state.buffer.length;
 	    for (let n = start; n < end; n++) {
@@ -17639,7 +17805,13 @@ function requireApiRequest () {
 	      this.removeAbortListener = util.addAbortListener(signal, () => {
 	        this.reason = signal.reason ?? new RequestAbortedError();
 	        if (this.res) {
-	          util.destroy(this.res.on('error', noop), this.reason);
+	          // Null the reference before destroying, mirroring onResponseError, so
+	          // that chunks flushed after the abort (e.g. an async decompressor
+	          // flush) are dropped by the `!this.res` guard in onResponseData
+	          // instead of being pushed into the torn-down stream.
+	          const res = this.res;
+	          this.res = null;
+	          util.destroy(res.on('error', noop), this.reason);
 	        } else if (this.abort) {
 	          this.abort(this.reason);
 	        }
@@ -21579,6 +21751,7 @@ function requireRedirectHandler () {
 	    // https://tools.ietf.org/html/rfc7231#section-6.4.2
 	    // https://fetch.spec.whatwg.org/#http-redirect-fetch
 	    // In case of HTTP 301 or 302 with POST, change the method to GET
+	    // QUERY is safe (RFC 10008) and should not change method like GET.
 	    if ((statusCode === 301 || statusCode === 302) && this.opts.method === 'POST') {
 	      this.opts.method = 'GET';
 	      if (util.isStream(this.opts.body)) {
@@ -30773,7 +30946,16 @@ function requireFetch () {
 	    // Otherwise:
 
 	    // 1. Set httpRequest to a clone of request.
-	    httpRequest = cloneRequest(request);
+	    // Implementations are encouraged to avoid teeing request’s body’s stream
+	    // when request’s body’s source is null as only a single body is needed in
+	    // that case. E.g., when request’s body’s source is null, redirects and
+	    // authentication will end up failing the fetch.
+	    if (request.body?.source != null) {
+	      httpRequest = cloneRequest(request);
+	    } else {
+	      httpRequest = cloneRequest({ ...request, body: null });
+	      httpRequest.body = request.body;
+	    }
 
 	    // 2. Set httpFetchParams to a copy of fetchParams.
 	    httpFetchParams = { ...fetchParams };
@@ -30900,7 +31082,7 @@ function requireFetch () {
 	  //    TODO: https://github.com/whatwg/fetch/issues/1285#issuecomment-896560129
 	  if (!httpRequest.headersList.contains('accept-encoding', true)) {
 	    if (urlHasHttpsScheme(requestCurrentURL(httpRequest))) {
-	      httpRequest.headersList.append('accept-encoding', 'br, gzip, deflate', true);
+	      httpRequest.headersList.append('accept-encoding', 'br, gzip, deflate, zstd', true);
 	    } else {
 	      httpRequest.headersList.append('accept-encoding', 'gzip, deflate', true);
 	    }
@@ -43464,7 +43646,7 @@ function _getGlobal(key, defaultValue) {
 const toolName = 'vals';
 const githubRepository = 'helmfile/vals';
 // renovate: github=helmfile/vals
-const defaultVersion = 'v0.44.2';
+const defaultVersion = 'v0.44.3';
 function binaryName(version, os, arch) {
     version = semverExports.clean(version) || version;
     return `${toolName}_${version}_${os}_${arch}.tar.gz`;
