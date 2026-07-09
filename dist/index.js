@@ -2812,11 +2812,32 @@ function requireUtil$5 () {
 	  destroy(socket, new ConnectTimeoutError(message));
 	}
 
+	let lastUrlString = null;
+	let lastProtocol = null;
+
 	/**
 	 * @param {string} urlString
 	 * @returns {string}
 	 */
 	function getProtocolFromUrlString (urlString) {
+	  // Requests are typically dispatched against the same origin over and over,
+	  // so cache the last (urlString, protocol) pair to skip re-parsing.
+	  if (urlString === lastUrlString) {
+	    return lastProtocol
+	  }
+
+	  const protocol = getProtocolFromUrlStringSlow(urlString);
+	  lastUrlString = urlString;
+	  lastProtocol = protocol;
+
+	  return protocol
+	}
+
+	/**
+	 * @param {string} urlString
+	 * @returns {string}
+	 */
+	function getProtocolFromUrlStringSlow (urlString) {
 	  if (
 	    urlString[0] === 'h' &&
 	    urlString[1] === 't' &&
@@ -8067,7 +8088,10 @@ function requireUtil$4 () {
 	  // 18. If rangeStartValue and rangeEndValue are numbers, and rangeStartValue is
 	  //     greater than rangeEndValue, then return failure.
 	  // Note: ... when can they not be numbers?
-	  if (rangeStartValue > rangeEndValue) {
+	  // Note: rangeStartValue or rangeEndValue may be null for open-ended ranges
+	  //     such as `bytes=5-` or `bytes=-5`. A null value must not be coerced to 0
+	  //     in the comparison, so this check only applies when both are numbers.
+	  if (rangeStartValue !== null && rangeEndValue !== null && rangeStartValue > rangeEndValue) {
 	    return 'failure'
 	  }
 
@@ -11857,13 +11881,23 @@ function requireClientH2 () {
 	}
 
 	function completeRequest (client, request, resetPendingIdx = false) {
-	  const index = client[kQueue].indexOf(request, client[kRunningIdx]);
+	  const queue = client[kQueue];
+	  const runningIdx = client[kRunningIdx];
+
+	  // In-order completion: advance the running index instead of splicing.
+	  // The client's resume loop compacts the queue once the index grows.
+	  if (runningIdx < client[kPendingIdx] && queue[runningIdx] === request) {
+	    client[kRunningIdx] = runningIdx + 1;
+	    return
+	  }
+
+	  const index = queue.indexOf(request, runningIdx);
 
 	  if (index === -1 || index >= client[kPendingIdx]) {
 	    return
 	  }
 
-	  client[kQueue].splice(index, 1);
+	  queue.splice(index, 1);
 	  client[kPendingIdx]--;
 
 	  if (resetPendingIdx && client[kPendingIdx] < client[kRunningIdx]) {
@@ -11915,6 +11949,11 @@ function requireClientH2 () {
 	  session[kSocket] = socket;
 	  session[kHTTP2SessionState] = {
 	    idleTimeout: null,
+	    // Sockets start out ref'd. Session ref/unref proxies to the socket, so a
+	    // single cached flag lets us skip redundant uv ref/unref calls, provided
+	    // every ref/unref of the session or its socket goes through
+	    // refH2Session/unrefH2Session.
+	    refed: true,
 	    ping: {
 	      interval: client[kPingInterval] === 0 ? null : setInterval(onHttp2SendPing, client[kPingInterval], session).unref()
 	    }
@@ -11941,7 +11980,7 @@ function requireClientH2 () {
 	  // TODO (@metcoder95): implement SETTINGS support
 	  // util.addListener(session, 'localSettings', onHttp2RemoteSettings)
 
-	  session.unref();
+	  unrefH2Session(session);
 
 	  client[kHTTP2Session] = session;
 	  socket[kHTTP2Session] = session;
@@ -12030,17 +12069,36 @@ function requireClientH2 () {
 	  }
 	}
 
+	// Session ref/unref proxies to the underlying socket, so refH2Session and
+	// unrefH2Session cover both and can skip the call when the cached ref state
+	// already matches.
+	function refH2Session (session) {
+	  const state = session[kHTTP2SessionState];
+
+	  if (state.refed === false) {
+	    state.refed = true;
+	    session.ref();
+	  }
+	}
+
+	function unrefH2Session (session) {
+	  const state = session[kHTTP2SessionState];
+
+	  if (state.refed === true) {
+	    state.refed = false;
+	    session.unref();
+	  }
+	}
+
 	function resumeH2 (client) {
 	  const socket = client[kSocket];
 	  const session = client[kHTTP2Session];
 
 	  if (socket?.destroyed === false) {
 	    if (client[kSize] === 0 || client[kMaxConcurrentStreams] === 0) {
-	      socket.unref();
-	      session.unref();
+	      unrefH2Session(session);
 	    } else {
-	      socket.ref();
-	      session.ref();
+	      refH2Session(session);
 	    }
 
 	    if (client[kSize] === 0 && session[kOpenStreams] === 0) {
@@ -12342,7 +12400,7 @@ function requireClientH2 () {
 	  stream[kHTTP2Session] = null;
 	  session[kOpenStreams] -= 1;
 	  if (session[kOpenStreams] === 0) {
-	    session.unref();
+	    unrefH2Session(session);
 	    setHttp2IdleTimeout(session);
 	  }
 	}
@@ -12367,12 +12425,10 @@ function requireClientH2 () {
 
 	    if (state.pendingEnd && !state.request.aborted && !state.request.completed) {
 	      state.request.onResponseEnd(state.trailers || {});
-	      state.finalizeRequest();
+	      finalizeRequest(state);
 	    }
 	  }
 
-	  this.off('data', onData);
-	  this.off('error', noop);
 	  closeStreamSession(this);
 	  this[kRequestStreamState] = null;
 	}
@@ -12495,7 +12551,7 @@ function requireClientH2 () {
 
 	  removeUpgradeStreamListeners(stream);
 	  detachRequestFromStream(request);
-	  state.finalizeRequest();
+	  finalizeRequest(state);
 	}
 
 	function setupUpgradeStream (stream, state) {
@@ -12518,12 +12574,51 @@ function requireClientH2 () {
 	  stream.setTimeout(headersTimeout);
 	}
 
+	function finalizeRequest (state, resetPendingIdx = false) {
+	  if (state.requestFinalized) {
+	    return
+	  }
+
+	  state.requestFinalized = true;
+	  completeRequest(state.client, state.request, resetPendingIdx);
+
+	  state.client[kResume]();
+	}
+
+	function openStream (client, request, session, abort, headers, options) {
+	  try {
+	    return session.request(headers, options)
+	  } catch (err) {
+	    // A GOAWAY'd session rejects new streams, same as an invalid session:
+	    // reset and requeue on a fresh connection rather than the destroy + abort
+	    // below, whose destroy(socket, err) can crash via an unhandled 'error'.
+	    if (err?.code === 'ERR_HTTP2_INVALID_SESSION' || err?.code === 'ERR_HTTP2_GOAWAY_SESSION') {
+	      const wrappedErr = new SocketError(err.message, util.getSocketInfo(session[kSocket]));
+	      wrappedErr.cause = err;
+	      session[kError] = wrappedErr;
+	      resetHttp2Session(session, wrappedErr);
+	      requeueUnsentRequest(client, request);
+
+	      return null
+	    }
+
+	    const wrappedErr = new InformationalError(err.message, { cause: err });
+	    session[kError] = wrappedErr;
+	    session[kSocket][kError] = wrappedErr;
+
+	    session.destroy(wrappedErr);
+	    util.destroy(session[kSocket], wrappedErr);
+	    abort(wrappedErr);
+
+	    return null
+	  }
+	}
+
 	function writeH2 (client, request) {
 	  const headersTimeout = request.headersTimeout ?? client[kHeadersTimeout];
 	  const bodyTimeout = request.bodyTimeout ?? client[kBodyTimeout];
 	  const session = client[kHTTP2Session];
 	  const { method, path, host, upgrade, expectContinue, signal, protocol, headers: reqHeaders } = request;
-	  let { body } = request;
 
 	  if (upgrade != null && upgrade !== 'websocket') {
 	    util.errorRequest(client, request, new InvalidArgumentError(`Custom upgrade "${upgrade}" not supported over HTTP/2`));
@@ -12532,22 +12627,28 @@ function requireClientH2 () {
 
 	  const headers = buildRequestHeaders(reqHeaders);
 
-	  /** @type {import('node:http2').ClientHttp2Stream} */
-	  let stream = null;
-
 	  headers[HTTP2_HEADER_AUTHORITY] = host || client[kHostAuthority];
 	  headers[HTTP2_HEADER_METHOD] = method;
 
-	  let requestFinalized = false;
-	  const finalizeRequest = (resetPendingIdx = false) => {
-	    if (requestFinalized) {
-	      return
-	    }
-
-	    requestFinalized = true;
-	    completeRequest(client, request, resetPendingIdx);
-
-	    client[kResume]();
+	  // Single pre-shaped state object shared by all stream event handlers.
+	  // All fields are declared up-front so the object keeps a stable hidden
+	  // class for the whole request lifetime.
+	  const state = {
+	    abort: null,
+	    body: request.body,
+	    client,
+	    contentLength: null,
+	    expectsPayload: false,
+	    request,
+	    headersTimeout,
+	    bodyTimeout,
+	    requestFinalized: false,
+	    responseReceived: false,
+	    bodySent: false,
+	    pendingEnd: false,
+	    trailers: null,
+	    session,
+	    stream: null
 	  };
 
 	  const abort = (err, resetPendingIdx = false) => {
@@ -12559,47 +12660,39 @@ function requireClientH2 () {
 
 	    util.errorRequest(client, request, err);
 
-	    if (stream != null) {
+	    if (state.stream != null) {
 	      clearRequestStream(request);
 
-	      // On Abort, we close the stream to send RST_STREAM frame
+	      // On Abort, we close the stream to send RST_STREAM frame.
+	      const stream = state.stream;
 	      stream.close();
+
+	      // close() alone leaves cleanup waiting on the 'close' event; on a busy,
+	      // long-lived multiplexed session that event can fail to fire, leaving the
+	      // native Http2Stream (and the whole request graph it pins) alive for the
+	      // session's life. Destroy the stream to release the handle
+	      // deterministically, but defer it by a setImmediate so the RST_STREAM
+	      // frame queued by close() gets a chance to be written first.
+	      setImmediate(() => {
+	        if (!stream.destroyed) {
+	          util.destroy(stream);
+	        }
+	      });
 
 	      // We move the running index to the next request
 	      client[kOnError](err);
-	      finalizeRequest(resetPendingIdx);
+	      finalizeRequest(state, resetPendingIdx);
 	    }
 
 	    // We do not destroy the socket as we can continue using the session
 	    // the stream gets destroyed and the session remains to create new streams
-	    util.destroy(body, err);
+	    util.destroy(state.body, err);
 	  };
 
-	  const requestStream = (headers, options) => {
-	    try {
-	      return session.request(headers, options)
-	    } catch (err) {
-	      if (err?.code === 'ERR_HTTP2_INVALID_SESSION') {
-	        const wrappedErr = new SocketError(err.message, util.getSocketInfo(session[kSocket]));
-	        wrappedErr.cause = err;
-	        session[kError] = wrappedErr;
-	        resetHttp2Session(session, wrappedErr);
-	        requeueUnsentRequest(client, request);
+	  state.abort = abort;
 
-	        return null
-	      }
-
-	      const wrappedErr = new InformationalError(err.message, { cause: err });
-	      session[kError] = wrappedErr;
-	      session[kSocket][kError] = wrappedErr;
-
-	      session.destroy(wrappedErr);
-	      util.destroy(session[kSocket], wrappedErr);
-	      abort(wrappedErr);
-
-	      return null
-	    }
-	  };
+	  /** @type {import('node:http2').ClientHttp2Stream} */
+	  let stream = null;
 
 	  try {
 	    // We are already connected, streams are pending.
@@ -12614,24 +12707,13 @@ function requireClientH2 () {
 	  }
 
 	  if (upgrade || method === 'CONNECT') {
-	    session.ref();
-
-	    const upgradeState = {
-	      abort,
-	      finalizeRequest,
-	      request,
-	      headersTimeout,
-	      bodyTimeout,
-	      responseReceived: false,
-	      session,
-	      stream: null
-	    };
+	    refH2Session(session);
 
 	    if (upgrade === 'websocket') {
 	      // We cannot upgrade to websocket if extended CONNECT protocol is not supported
 	      if (session[kEnableConnectProtocol] === false) {
 	        util.errorRequest(client, request, new InformationalError('HTTP/2: Extended CONNECT protocol not supported by server'));
-	        session.unref();
+	        unrefH2Session(session);
 	        return false
 	      }
 
@@ -12649,12 +12731,12 @@ function requireClientH2 () {
 	        headers[HTTP2_HEADER_SCHEME] = protocol === 'http:' ? 'http' : 'https';
 	      }
 
-	      stream = requestStream(headers, { endStream: false, signal });
+	      stream = openStream(client, request, session, abort, headers, { endStream: false, signal });
 	      if (stream == null) {
-	        session.unref();
+	        unrefH2Session(session);
 	        return false
 	      }
-	      setupUpgradeStream(stream, upgradeState);
+	      setupUpgradeStream(stream, state);
 	      return true
 	    }
 
@@ -12663,12 +12745,12 @@ function requireClientH2 () {
 	    // will create a new stream. We trigger a request to create the stream and wait until
 	    // `ready` event is triggered
 	    // We disabled endStream to allow the user to write to the stream
-	    stream = requestStream(headers, { endStream: false, signal });
+	    stream = openStream(client, request, session, abort, headers, { endStream: false, signal });
 	    if (stream == null) {
-	      session.unref();
+	      unrefH2Session(session);
 	      return false
 	    }
-	    setupUpgradeStream(stream, upgradeState);
+	    setupUpgradeStream(stream, state);
 
 	    return true
 	  }
@@ -12695,6 +12777,8 @@ function requireClientH2 () {
 	    method === 'PROPFIND' ||
 	    method === 'PROPPATCH'
 	  );
+
+	  let body = state.body;
 
 	  if (body && typeof body.read === 'function') {
 	    // Try to read EOF in order to get length.
@@ -12742,7 +12826,7 @@ function requireClientH2 () {
 	    headers[HTTP2_HEADER_CONTENT_LENGTH] = `${contentLength}`;
 	  }
 
-	  session.ref();
+	  refH2Session(session);
 
 	  if (channels.sendHeaders.hasSubscribers) {
 	    let header = '';
@@ -12754,27 +12838,16 @@ function requireClientH2 () {
 
 	  // TODO(metcoder95): add support for sending trailers
 	  const shouldEndStream = body === null || contentLength === 0;
-	  const state = {
-	    abort,
-	    body,
-	    client,
-	    contentLength,
-	    expectsPayload,
-	    finalizeRequest,
-	    request,
-	    headersTimeout,
-	    bodyTimeout,
-	    responseReceived: false,
-	    bodySent: false,
-	    session,
-	    stream: null
-	  };
+
+	  state.body = body;
+	  state.contentLength = contentLength;
+	  state.expectsPayload = expectsPayload;
 
 	  if (expectContinue) {
 	    headers[HTTP2_HEADER_EXPECT] = '100-continue';
 	  }
 
-	  stream = requestStream(headers, { endStream: shouldEndStream, signal });
+	  stream = openStream(client, request, session, abort, headers, { endStream: shouldEndStream, signal });
 	  if (stream == null) {
 	    return false
 	  }
@@ -12785,22 +12858,30 @@ function requireClientH2 () {
 	  // Increment counter as we have new streams open
 	  clearHttp2IdleTimeout(session);
 	  ++session[kOpenStreams];
-	  stream.setTimeout(headersTimeout);
+
+	  if (headersTimeout) {
+	    stream.setTimeout(headersTimeout);
+	  }
 
 	  stream[kHTTP2Session] = session;
-	  stream.once('close', onRequestStreamClose);
+	  stream.on('close', onRequestStreamClose);
 
 	  bindRequestToStream(request, stream, releaseRequestStream);
 	  if (expectContinue) {
 	    stream.once('continue', writeBodyH2);
 	  }
-	  stream.once('response', onResponse);
-	  stream.once('end', onEnd);
-	  stream.once('error', onError);
-	  stream.once('frameError', onFrameError);
+	  // The handlers below either remove themselves on first invocation or
+	  // become unreachable once the stream closes, so plain `on` avoids the
+	  // per-listener `once` wrapper allocation.
+	  stream.on('response', onResponse);
+	  stream.on('end', onEnd);
+	  stream.on('error', onError);
+	  stream.on('frameError', onFrameError);
 	  stream.on('aborted', onAborted);
-	  stream.on('timeout', onTimeout);
-	  stream.once('trailers', onTrailers);
+	  if (headersTimeout || bodyTimeout) {
+	    stream.on('timeout', onTimeout);
+	  }
+	  stream.on('trailers', onTrailers);
 
 	  if (!expectContinue) {
 	    writeBodyH2.call(stream);
@@ -12838,16 +12919,24 @@ function requireClientH2 () {
 	    detachRequestFromStream(request);
 	  }
 
-	  removeRequestStreamListeners(stream);
-
+	  // A closed or destroyed stream cannot emit further events; leaving the
+	  // listeners in place saves the removal scans (they are collected with
+	  // the stream). All handlers bail out when the stream state is gone.
 	  if (!stream.destroyed && !stream.closed) {
+	    removeRequestStreamListeners(stream);
 	    stream.once('error', noop);
 	  }
 	}
 
 	function onData (chunk) {
 	  const stream = this;
-	  const { request } = stream[kRequestStreamState];
+	  const state = stream[kRequestStreamState];
+
+	  if (state == null) {
+	    return
+	  }
+
+	  const { request } = state;
 
 	  if (request.aborted || request.completed) {
 	    return
@@ -12861,6 +12950,11 @@ function requireClientH2 () {
 	function onResponse (headers) {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
+
+	  if (state == null) {
+	    return
+	  }
+
 	  const { request } = state;
 
 	  stream.off('response', onResponse);
@@ -12876,14 +12970,20 @@ function requireClientH2 () {
 	  delete headers[HTTP2_HEADER_STATUS];
 	  request.onResponseStarted();
 	  state.responseReceived = true;
-	  stream.setTimeout(state.bodyTimeout);
+
+	  if (state.headersTimeout || state.bodyTimeout) {
+	    stream.setTimeout(state.bodyTimeout);
+	  }
 
 	  // Due to the stream nature, it is possible we face a race condition
 	  // where the stream has been assigned, but the request has been aborted
-	  // the request remains in-flight and headers hasn't been received yet
-	  // for those scenarios, best effort is to destroy the stream immediately
-	  // as there's no value to keep it open.
-	  if (request.aborted) {
+	  // or already completed and headers hasn't been received yet. A late
+	  // 'response' delivered after completion would call request.onResponseStart
+	  // post-completion, tripping its `assert(!this.completed)` (an uncatchable
+	  // throw on the http2 event tick). Guard `completed` here as onEnd/onTrailers
+	  // already do; best effort is to release the stream immediately as there's
+	  // no value to keep it open.
+	  if (request.aborted || request.completed) {
 	    releaseRequestStream(stream);
 	    return
 	  }
@@ -12898,6 +12998,11 @@ function requireClientH2 () {
 	function onEnd () {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
+
+	  if (state == null) {
+	    return
+	  }
+
 	  const { request } = state;
 
 	  stream.off('end', onEnd);
@@ -12921,6 +13026,10 @@ function requireClientH2 () {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
 
+	  if (state == null) {
+	    return
+	  }
+
 	  stream.off('error', onError);
 	  state.abort(err);
 	}
@@ -12928,6 +13037,10 @@ function requireClientH2 () {
 	function onFrameError (type, code) {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
+
+	  if (state == null) {
+	    return
+	  }
 
 	  stream.off('frameError', onFrameError);
 	  state.abort(new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`));
@@ -12941,6 +13054,10 @@ function requireClientH2 () {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
 
+	  if (state == null) {
+	    return
+	  }
+
 	  // Remove self so timeout doesn't fire again after we handle it
 	  stream.off('timeout', onTimeout);
 
@@ -12953,6 +13070,11 @@ function requireClientH2 () {
 	function onTrailers (trailers) {
 	  const stream = this;
 	  const state = stream[kRequestStreamState];
+
+	  if (state == null) {
+	    return
+	  }
+
 	  const { request } = state;
 
 	  stream.off('trailers', onTrailers);
@@ -16074,10 +16196,15 @@ function requireProxyAgent () {
 	  return new Pool(origin, opts)
 	}
 
+	function shouldProxyTunnel (requestProtocol, proxyTunnel) {
+	  return proxyTunnel === true || requestProtocol !== 'http:'
+	}
+
 	class Http1ProxyWrapper extends DispatcherBase {
 	  #client
+	  #proxyServername
 
-	  constructor (proxyUrl, { headers = {}, connect, factory }) {
+	  constructor (proxyUrl, { headers = {}, connect, factory, proxyServername }) {
 	    if (!proxyUrl) {
 	      throw new InvalidArgumentError('Proxy URL is mandatory')
 	    }
@@ -16085,6 +16212,7 @@ function requireProxyAgent () {
 	    super();
 
 	    this[kProxyHeaders] = headers;
+	    this.#proxyServername = proxyServername;
 	    if (factory) {
 	      this.#client = factory(proxyUrl, { connect });
 	    } else {
@@ -16119,6 +16247,13 @@ function requireProxyAgent () {
 	    }
 	    opts.headers = { ...this[kProxyHeaders], ...headers };
 
+	    // Pin the SNI/cert hostname to the proxy. Without this the underlying
+	    // Client would derive it from the (rewritten) Host header, which points
+	    // at the target — wrong for the TLS handshake to the proxy itself.
+	    if (this.#proxyServername != null) {
+	      opts.servername = this.#proxyServername;
+	    }
+
 	    return this.#client[kDispatch](opts, handler)
 	  }
 
@@ -16142,7 +16277,7 @@ function requireProxyAgent () {
 	      throw new InvalidArgumentError('Proxy opts.clientFactory must be a function.')
 	    }
 
-	    const { proxyTunnel = true, connectTimeout } = opts;
+	    const { proxyTunnel, connectTimeout } = opts;
 
 	    super();
 
@@ -16169,6 +16304,7 @@ function requireProxyAgent () {
 	    }
 
 	    const connect = buildConnector({ timeout: connectTimeout, ...opts.proxyTls });
+	    const connectHTTP1 = buildConnector({ timeout: connectTimeout, ...opts.proxyTls, allowH2: false });
 	    this[kConnectEndpoint] = buildConnector({ timeout: connectTimeout, ...opts.requestTls });
 	    this[kConnectEndpointHTTP1] = buildConnector({ timeout: connectTimeout, ...opts.requestTls, allowH2: false });
 
@@ -16189,11 +16325,23 @@ function requireProxyAgent () {
 	        })
 	      }
 
-	      if (!this[kTunnelProxy] && protocol === 'http:' && this[kProxy].protocol === 'http:') {
+	      if (!shouldProxyTunnel(protocol, this[kTunnelProxy])) {
+	        const forwardConnect = this[kProxy].protocol === 'https:'
+	          ? (opts, cb) => connectHTTP1(opts, (err, socket) => {
+	              if (err && err.code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
+	                cb(new SecureProxyConnectionError(err));
+	              } else {
+	                cb(err, socket);
+	              }
+	            })
+	          : connectHTTP1;
 	        return new Http1ProxyWrapper(this[kProxy].uri, {
 	          headers: this[kProxyHeaders],
-	          connect,
-	          factory: agentFactory
+	          connect: forwardConnect,
+	          factory: agentFactory,
+	          proxyServername: this[kProxy].protocol === 'https:'
+	            ? (this[kProxyTls]?.servername || proxyHostname)
+	            : undefined
 	        })
 	      }
 	      return agentFactory(origin, options)
@@ -17697,6 +17845,10 @@ function requireReadable () {
 	 * @returns {void}
 	 */
 	function consumePush (consume, chunk) {
+	  if (consume.body === null) {
+	    return
+	  }
+
 	  consume.length += chunk.length;
 	  consume.body.push(chunk);
 	}
@@ -33116,7 +33268,7 @@ function requireUtil$2 () {
 
 	    if (
 	      code < 0x20 || // exclude CTLs (0-31)
-	      code === 0x7F || // DEL
+	      code > 0x7E || // exclude non-ascii and DEL
 	      code === 0x3B // ;
 	    ) {
 	      throw new Error('Invalid cookie path')
@@ -33479,8 +33631,9 @@ function requireParse$1 () {
 
 	    // 2. If the attribute-value failed to parse as a cookie date, ignore
 	    //    the cookie-av.
-
-	    cookieAttributeList.expires = expiryTime;
+	    if (!Number.isNaN(expiryTime.getTime())) {
+	      cookieAttributeList.expires = expiryTime;
+	    }
 	  } else if (attributeNameLowercase === 'max-age') {
 	    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.2
 	    // If the attribute-name case-insensitively matches the string "Max-
@@ -37301,7 +37454,7 @@ function requireUtil () {
 	    destination,
 	    mode,
 	    credentials: credentialsMode,
-	    useCredentials: true
+	    useURLCredentials: true
 	  })
 	}
 
@@ -43646,7 +43799,7 @@ function _getGlobal(key, defaultValue) {
 const toolName = 'vals';
 const githubRepository = 'helmfile/vals';
 // renovate: github=helmfile/vals
-const defaultVersion = 'v0.44.3';
+const defaultVersion = 'v0.44.4';
 function binaryName(version, os, arch) {
     version = semverExports.clean(version) || version;
     return `${toolName}_${version}_${os}_${arch}.tar.gz`;
