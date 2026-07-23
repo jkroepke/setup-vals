@@ -31,6 +31,7 @@ import require$$8 from 'node:util/types';
 import require$$2$1 from 'node:worker_threads';
 import require$$2$2 from 'node:crypto';
 import require$$1$2 from 'node:sqlite';
+import require$$11 from 'node:stream/web';
 import require$$0$6 from 'node:url';
 import require$$1$3 from 'node:async_hooks';
 import require$$1$4 from 'node:console';
@@ -2263,7 +2264,12 @@ function requireUtil$5 () {
 	      stream.socket = null;
 	    }
 
-	    stream.destroy(err);
+	    try {
+	      stream.destroy(err);
+	    } catch {
+	      // stream.destroy may throw on managed sockets (e.g., http2).
+	      // Silently ignore — the socket lifecycle is handled by the subsystem.
+	    }
 	  } else if (err) {
 	    queueMicrotask(() => {
 	      stream.emit('error', err);
@@ -3393,7 +3399,7 @@ function requireRequest$1 () {
 
 	    this.method = method;
 
-	    this.typeOfService = typeOfService ?? 0;
+	    this.typeOfService = typeOfService;
 
 	    this.abort = null;
 
@@ -9422,6 +9428,7 @@ function requireBody () {
 	const { multipartFormDataParser } = requireFormdataParser();
 	const { parseJSONFromBytes } = requireInfra();
 	const { utf8DecodeBytes } = requireEncoding();
+	const { ReadableStreamTee } = require$$11;
 
 	const textEncoder = new TextEncoder();
 	function noop () {}
@@ -9685,7 +9692,7 @@ function requireBody () {
 	  // https://fetch.spec.whatwg.org/#concept-body-clone
 
 	  // 1. Let « out1, out2 » be the result of teeing body’s stream.
-	  const { 0: out1, 1: out2 } = body.stream.tee();
+	  const { 0: out1, 1: out2 } = ReadableStreamTee?.(body.stream, true) ?? body.stream.tee();
 
 	  // 2. Set body’s stream to out1.
 	  body.stream = out1;
@@ -10020,6 +10027,7 @@ function requireClientH1 () {
 	const kIdleSocketValidation = Symbol('kIdleSocketValidation');
 	const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout');
 	const kSocketUsed = Symbol('kSocketUsed');
+	const kTypeOfService = Symbol('kTypeOfService');
 
 	let extractBody;
 
@@ -11010,7 +11018,7 @@ function requireClientH1 () {
 
 	function clearIdleSocketValidation (socket) {
 	  if (socket[kIdleSocketValidationTimeout]) {
-	    clearTimeout(socket[kIdleSocketValidationTimeout]);
+	    clearImmediate(socket[kIdleSocketValidationTimeout]);
 	    socket[kIdleSocketValidationTimeout] = null;
 	  }
 
@@ -11019,14 +11027,14 @@ function requireClientH1 () {
 
 	function scheduleIdleSocketValidation (client, socket) {
 	  socket[kIdleSocketValidation] = 1;
-	  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+	  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
 	    socket[kIdleSocketValidationTimeout] = null;
 	    socket[kIdleSocketValidation] = 2;
 
 	    if (client[kSocket] === socket && !socket.destroyed) {
 	      client[kResume]();
 	    }
-	  }, 0);
+	  });
 	  socket[kIdleSocketValidationTimeout].unref?.();
 	}
 
@@ -11092,6 +11100,32 @@ function requireClientH1 () {
 	// https://www.rfc-editor.org/rfc/rfc7230#section-3.3.2
 	function shouldSendContentLength (method) {
 	  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && method !== 'TRACE' && method !== 'CONNECT'
+	}
+
+	function setTypeOfService (socket, request) {
+	  if (typeof socket.setTypeOfService !== 'function') {
+	    return
+	  }
+
+	  const typeOfService = request.typeOfService;
+
+	  if (typeOfService === undefined) {
+	    return
+	  }
+
+	  const currentTypeOfService = socket[kTypeOfService];
+
+	  if (currentTypeOfService === typeOfService) {
+	    return
+	  }
+
+	  try {
+	    socket.setTypeOfService(typeOfService);
+	    socket[kTypeOfService] = typeOfService;
+	  } catch {
+	    // QoS marking is best-effort. setTypeOfService() can throw synchronously on
+	    // some platforms depending on socket state, but that must not abort the request.
+	  }
 	}
 
 	/**
@@ -11225,9 +11259,7 @@ function requireClientH1 () {
 	    socket[kBlocking] = true;
 	  }
 
-	  if (socket.setTypeOfService) {
-	    socket.setTypeOfService(request.typeOfService);
-	  }
+	  setTypeOfService(socket, request);
 
 	  let header = `${method} ${path} HTTP/1.1\r\n`;
 
@@ -11884,9 +11916,10 @@ function requireClientH2 () {
 	  const queue = client[kQueue];
 	  const runningIdx = client[kRunningIdx];
 
-	  // In-order completion: advance the running index instead of splicing.
-	  // The client's resume loop compacts the queue once the index grows.
+	  // In-order completion: clear the request and advance without splicing.
+	  // The client's resume loop compacts cleared slots once the index grows.
 	  if (runningIdx < client[kPendingIdx] && queue[runningIdx] === request) {
+	    queue[runningIdx] = null;
 	    client[kRunningIdx] = runningIdx + 1;
 	    return
 	  }
@@ -11973,7 +12006,6 @@ function requireClientH2 () {
 
 	  util.addListener(session, 'error', onHttp2SessionError);
 	  util.addListener(session, 'frameError', onHttp2FrameError);
-	  util.addListener(session, 'end', onHttp2SessionEnd);
 	  util.addListener(session, 'goaway', onHttp2SessionGoAway);
 	  util.addListener(session, 'close', onHttp2SessionClose);
 	  util.addListener(session, 'remoteSettings', onHttp2RemoteSettings);
@@ -12049,16 +12081,6 @@ function requireClientH2 () {
 	          // Don't dispatch an upgrade until all preceding requests have completed.
 	          // Possibly, we do not have remote settings confirmed yet.
 	          if ((request.upgrade === 'websocket' || request.method === 'CONNECT') && session[kRemoteSettings] === false) return true
-	          // Request with stream or iterator body can error while other requests
-	          // are inflight and indirectly error those as well.
-	          // Ensure this doesn't happen by waiting for inflight
-	          // to complete before dispatching.
-
-	          // Request with stream or iterator body cannot be retried.
-	          // Ensure that no other requests are inflight and
-	          // could cause failure.
-	          if (util.bodyLength(request.body) !== 0 &&
-	            (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))) return true
 	        } else {
 	          return (request.upgrade === 'websocket' || request.method === 'CONNECT') && session[kRemoteSettings] === false
 	        }
@@ -12232,12 +12254,6 @@ function requireClientH2 () {
 	  }
 	}
 
-	function onHttp2SessionEnd () {
-	  const err = new SocketError('other side closed', util.getSocketInfo(this[kSocket]));
-	  this.destroy(err);
-	  util.destroy(this[kSocket], err);
-	}
-
 	/**
 	 * This is the root cause of #3011
 	 * We need to handle GOAWAY frames properly, and trigger the session close
@@ -12381,7 +12397,7 @@ function requireClientH2 () {
 	    return
 	  }
 
-	  this[kClient][kOnError](err);
+	  this[kHTTP2Session]?.[kClient]?.[kOnError](err);
 	}
 
 	function onHttp2SocketEnd () {
@@ -12415,20 +12431,24 @@ function requireClientH2 () {
 	  closeStreamSession(this);
 	}
 
-	function onRequestStreamClose () {
+	// Idempotent terminal cleanup, called from both 'end' and 'close': the
+	// null-state guard no-ops the later call.
+	function completeRequestStream () {
 	  const state = this[kRequestStreamState];
 
-	  if (state) {
-	    // Release the stream first so request references are cleared,
-	    // then complete the response with trailers if available.
-	    releaseRequestStream(this);
-
-	    if (state.pendingEnd && !state.request.aborted && !state.request.completed) {
-	      state.request.onResponseEnd(state.trailers || {});
-	      finalizeRequest(state);
-	    }
+	  if (state == null) {
+	    return
 	  }
 
+	  // Release the stream first so request references are cleared,
+	  // then complete the response with trailers if available.
+	  releaseRequestStream(this);
+
+	  if (state.pendingEnd && !state.request.aborted && !state.request.completed) {
+	    state.request.onResponseEnd(state.trailers || {});
+	  }
+
+	  finalizeRequest(state);
 	  closeStreamSession(this);
 	  this[kRequestStreamState] = null;
 	}
@@ -12670,14 +12690,14 @@ function requireClientH2 () {
 	      // close() alone leaves cleanup waiting on the 'close' event; on a busy,
 	      // long-lived multiplexed session that event can fail to fire, leaving the
 	      // native Http2Stream (and the whole request graph it pins) alive for the
-	      // session's life. Destroy the stream to release the handle
-	      // deterministically, but defer it by a setImmediate so the RST_STREAM
-	      // frame queued by close() gets a chance to be written first.
-	      setImmediate(() => {
-	        if (!stream.destroyed) {
-	          util.destroy(stream);
-	        }
-	      });
+	      // session's life. Destroy the stream synchronously to release the handle
+	      // deterministically. Deferring the destroy (e.g. via setImmediate) leaks
+	      // the same way when the event loop is stalled and the callback never runs
+	      // under abort churn (#5558); close() has already queued the RST_STREAM
+	      // frame on the native session, so a synchronous destroy still sends it.
+	      if (!stream.destroyed) {
+	        util.destroy(stream);
+	      }
 
 	      // We move the running index to the next request
 	      client[kOnError](err);
@@ -12864,7 +12884,7 @@ function requireClientH2 () {
 	  }
 
 	  stream[kHTTP2Session] = session;
-	  stream.on('close', onRequestStreamClose);
+	  stream.on('close', completeRequestStream);
 
 	  bindRequestToStream(request, stream, releaseRequestStream);
 	  if (expectContinue) {
@@ -13007,13 +13027,16 @@ function requireClientH2 () {
 
 	  stream.off('end', onEnd);
 
-	  // If we received a response, this is a normal completion.
-	  // Defer actual completion to onRequestStreamClose so that
-	  // onTrailers (which may fire after 'end' on Windows) can
-	  // store trailers first.
+	  // onTrailers (which may fire after 'end' on Windows) has already stored
+	  // trailers on the state by now, so completing here still delivers them.
 	  if (state.responseReceived) {
 	    if (!request.aborted && !request.completed) {
 	      state.pendingEnd = true;
+
+	      // Complete on 'end': a blocked event loop can keep the stream's 'close'
+	      // from firing, stranding its buffers until OOM. Idempotent, so a later
+	      // 'close' no-ops.
+	      completeRequestStream.call(stream);
 	    }
 	  } else {
 	    // Stream ended without receiving a response - this is an error
@@ -13084,7 +13107,7 @@ function requireClientH2 () {
 	    return
 	  }
 
-	  // Store trailers for onRequestStreamClose to use when completing
+	  // Store trailers for completeRequestStream to use when completing
 	  state.trailers = trailers;
 	}
 
@@ -15047,15 +15070,15 @@ function requireAgent () {
 	        }
 
 	        let hasOrigin = false;
-	        for (const client of this[kClients].values()) {
-	          if (client[kUrl].origin === dispatcher[kUrl].origin) {
+	        for (const k of this[kClients].keys()) {
+	          if (k === origin || k === `${origin}#http1-only`) {
 	            hasOrigin = true;
 	            break
 	          }
 	        }
 
 	        if (!hasOrigin) {
-	          this[kOrigins].delete(dispatcher[kUrl].origin);
+	          this[kOrigins].delete(origin);
 	        }
 	      };
 
@@ -16710,7 +16733,7 @@ function requireRetryHandler () {
 
 	function calculateRetryAfterHeader (retryAfter) {
 	  const retryTime = new Date(retryAfter).getTime();
-	  return isNaN(retryTime) ? 0 : retryTime - Date.now()
+	  return isNaN(retryTime) ? null : retryTime - Date.now()
 	}
 
 	// A stable controller handed to the downstream handler for the lifetime of the
@@ -16910,9 +16933,11 @@ function requireRetryHandler () {
 	    }
 
 	    const retryTimeout =
-	      retryAfterHeader > 0
-	        ? Math.min(retryAfterHeader, maxTimeout)
-	        : Math.min(minTimeout * timeoutFactor ** (counter - 1), maxTimeout);
+	      retryAfterHeader === 0
+	        ? 0
+	        : retryAfterHeader > 0
+	          ? Math.min(retryAfterHeader, maxTimeout)
+	          : Math.min(minTimeout * timeoutFactor ** (counter - 1), maxTimeout);
 
 	    setTimeout(() => cb(null), retryTimeout);
 	  }
@@ -19393,25 +19418,54 @@ function requireMockUtils () {
 	  // Get mock dispatch from built key
 	  const key = buildKey(opts);
 	  const mockDispatch = getMockDispatch(this[kDispatches], key);
+	  const mockDispatches = this[kDispatches];
 
 	  mockDispatch.timesInvoked++;
 
-	  // Here's where we resolve a callback if a callback is present for the dispatch data.
-	  if (mockDispatch.data.callback) {
-	    mockDispatch.data = { ...mockDispatch.data, ...mockDispatch.data.callback(opts) };
-	  }
-
-	  // Parse mockDispatch data
-	  const { data: { statusCode, data, headers, trailers, error }, delay, persist } = mockDispatch;
 	  const { timesInvoked, times } = mockDispatch;
 
 	  // If it's used up and not persistent, mark as consumed
-	  mockDispatch.consumed = !persist && timesInvoked >= times;
+	  mockDispatch.consumed = !mockDispatch.persist && timesInvoked >= times;
 	  mockDispatch.pending = timesInvoked < times;
+
+	  // Here's where we resolve a callback if a callback is present for the dispatch data.
+	  if (mockDispatch.data.callback) {
+	    const callbackResult = mockDispatch.data.callback(opts);
+
+	    // An asynchronous reply options callback resolves to the reply data, so
+	    // the dispatch can only continue once the returned promise settles.
+	    // A rejection cannot be thrown synchronously from the dispatch at that
+	    // point, so it is surfaced as a response error instead.
+	    if (isPromise(callbackResult)) {
+	      callbackResult.then(
+	        (resolvedData) => {
+	          mockDispatch.data = { ...mockDispatch.data, ...resolvedData };
+	          dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler);
+	        },
+	        (error) => {
+	          deleteMockDispatch(mockDispatches, key);
+	          handler.onResponseError(null, error);
+	        }
+	      );
+	      return true
+	    }
+
+	    mockDispatch.data = { ...mockDispatch.data, ...callbackResult };
+	  }
+
+	  return dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler)
+	}
+
+	/**
+	 * Replies to a request once the mock dispatch data is fully resolved
+	 */
+	function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
+	  // Parse mockDispatch data
+	  const { data: { statusCode, data, headers, trailers, error }, delay } = mockDispatch;
 
 	  // If specified, trigger dispatch error
 	  if (error !== null) {
-	    deleteMockDispatch(this[kDispatches], key);
+	    deleteMockDispatch(mockDispatches, key);
 	    handler.onResponseError(null, error);
 	    return true
 	  }
@@ -19454,10 +19508,10 @@ function requireMockUtils () {
 	  if (typeof delay === 'number' && delay > 0) {
 	    timer = setTimeout(() => {
 	      timer = null;
-	      handleReply(this[kDispatches]);
+	      handleReply(mockDispatches);
 	    }, delay);
 	  } else {
-	    handleReply(this[kDispatches]);
+	    handleReply(mockDispatches);
 	  }
 
 	  function handleReply (mockDispatches, _data = data) {
@@ -19623,6 +19677,11 @@ function requireMockInterceptor () {
 	} = requireMockSymbols();
 	const { InvalidArgumentError } = requireErrors();
 	const { serializePathWithQuery } = requireUtil$5();
+	const {
+	  types: {
+	    isPromise
+	  }
+	} = require$$3;
 
 	/**
 	 * Defines the scope API for an interceptor reply
@@ -19728,13 +19787,9 @@ function requireMockInterceptor () {
 	    // Values of reply aren't available right now as they
 	    // can only be available when the reply callback is invoked.
 	    if (typeof replyOptionsCallbackOrStatusCode === 'function') {
-	      // We'll first wrap the provided callback in another function,
-	      // this function will properly resolve the data from the callback
-	      // when invoked.
-	      const wrappedDefaultsCallback = (opts) => {
-	        // Our reply options callback contains the parameter for statusCode, data and options.
-	        const resolvedData = replyOptionsCallbackOrStatusCode(opts);
-
+	      // Resolves the data returned by a reply options callback into
+	      // dispatch data, validating its format along the way.
+	      const resolveReplyCallbackData = (resolvedData) => {
 	        // Check if it is in the right format
 	        if (typeof resolvedData !== 'object' || resolvedData === null) {
 	          throw new InvalidArgumentError('reply options callback must return an object')
@@ -19747,6 +19802,23 @@ function requireMockInterceptor () {
 	        return {
 	          ...this.createMockScopeDispatchData(replyParameters)
 	        }
+	      };
+
+	      // We'll first wrap the provided callback in another function,
+	      // this function will properly resolve the data from the callback
+	      // when invoked.
+	      const wrappedDefaultsCallback = (opts) => {
+	        // Our reply options callback contains the parameter for statusCode, data and options.
+	        const resolvedData = replyOptionsCallbackOrStatusCode(opts);
+
+	        // An asynchronous reply options callback resolves to the reply
+	        // parameters, so the dispatch data can only be resolved once the
+	        // returned promise settles.
+	        if (isPromise(resolvedData)) {
+	          return resolvedData.then(resolveReplyCallbackData)
+	        }
+
+	        return resolveReplyCallbackData(resolvedData)
 	      };
 
 	      // Add usual dispatch data, but this time set the data parameter to function that will eventually provide data.
@@ -21900,6 +21972,8 @@ function requireRedirectHandler () {
 	      throw new Error('max redirects')
 	    }
 
+	    let removeContentHeaders = statusCode === 303;
+
 	    // https://tools.ietf.org/html/rfc7231#section-6.4.2
 	    // https://fetch.spec.whatwg.org/#http-redirect-fetch
 	    // In case of HTTP 301 or 302 with POST, change the method to GET
@@ -21910,6 +21984,7 @@ function requireRedirectHandler () {
 	        util.destroy(this.opts.body.on('error', noop));
 	      }
 	      this.opts.body = null;
+	      removeContentHeaders = true;
 	    }
 
 	    // https://tools.ietf.org/html/rfc7231#section-6.4.4
@@ -21949,9 +22024,9 @@ function requireRedirectHandler () {
 	    }
 
 	    // Remove headers referring to the original URL.
-	    // By default it is Host only, unless it's a 303 (see below), which removes also all Content-* headers.
+	    // By default it is Host only. A 303 or a 301/302 POST-to-GET redirect also removes all Content-* headers.
 	    // https://tools.ietf.org/html/rfc7231#section-6.4
-	    this.opts.headers = cleanRequestHeaders(this.opts.headers, statusCode === 303, this.opts.origin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect);
+	    this.opts.headers = cleanRequestHeaders(this.opts.headers, removeContentHeaders, this.opts.origin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect);
 	    this.opts.path = path;
 	    this.opts.origin = origin;
 	    this.opts.query = null;
@@ -22960,15 +23035,57 @@ function requireCache$2 () {
 	    headers = {};
 
 	    if (hasSafeIterator(opts.headers)) {
-	      for (const x of opts.headers) {
-	        if (!Array.isArray(x)) {
-	          throw new Error('opts.headers is not a valid header map')
+	      if (Array.isArray(opts.headers)) {
+	        // Array format: could be flat alternating [k, v, k, v, ...]
+	        //  or array-of-pairs [[k, v], ...]
+	        const first = opts.headers[0];
+	        if (Array.isArray(first)) {
+	          for (const x of opts.headers) {
+	            if (!Array.isArray(x)) {
+	              throw new Error('opts.headers is not a valid header map')
+	            }
+	            const [key, val] = x;
+	            if (typeof key !== 'string' || typeof val !== 'string') {
+	              throw new Error('opts.headers is not a valid header map')
+	            }
+	            headers[key.toLowerCase()] = val;
+	          }
+	        } else {
+	          // Flat alternating array [k, v, k, v, ...]
+	          const len = opts.headers.length;
+	          if (len % 2 !== 0) {
+	            throw new Error('opts.headers is not a valid header map')
+	          }
+	          for (let i = 0; i < len; i += 2) {
+	            const key = opts.headers[i];
+	            const val = opts.headers[i + 1];
+	            if (typeof key !== 'string' || (typeof val !== 'string' && !Array.isArray(val))) {
+	              throw new Error('opts.headers is not a valid header map')
+	            }
+	            if (typeof val === 'string') {
+	              headers[key.toLowerCase()] = val;
+	            } else {
+	              const mapped = [];
+	              for (let j = 0; j < val.length; j++) {
+	                const v = val[j];
+	                mapped.push(typeof v === 'string' ? v : v.toString('latin1'));
+	              }
+	              headers[key.toLowerCase()] = mapped;
+	            }
+	          }
 	        }
-	        const [key, val] = x;
-	        if (typeof key !== 'string' || typeof val !== 'string') {
-	          throw new Error('opts.headers is not a valid header map')
+	      } else {
+	        // Non-array iterable (e.g. Map) — use original iteration logic
+	        for (const x of opts.headers) {
+	          if (!Array.isArray(x)) {
+	            throw new Error('opts.headers is not a valid header map')
+	          }
+	          const [key, val] = x;
+	          if (typeof key !== 'string' || typeof val !== 'string') {
+	            throw new Error('opts.headers is not a valid header map')
+	          }
+	          headers[key.toLowerCase()] = val;
 	        }
-	        headers[key.toLowerCase()] = val;
 	      }
 	    } else {
 	      for (const key of Object.keys(opts.headers)) {
@@ -24027,6 +24144,10 @@ function requireCacheHandler () {
 
 	const MAX_RESPONSE_AGE = 2147483647000;
 
+	// Retention for revalidation-only entries (zero freshness lifetime but a
+	//  validator present); each successful revalidation re-stores the entry.
+	const REVALIDATION_ONLY_RETENTION = 86400000; // 24 hours
+
 	/**
 	 * @typedef {import('../../types/dispatcher.d.ts').default.DispatchHandler} DispatchHandler
 	 *
@@ -24119,6 +24240,7 @@ function requireCacheHandler () {
 	      } catch {
 	        // Fail silently
 	      }
+	      this.#deleteLocationHeaderEntries(resHeaders);
 	      return downstreamOnHeaders()
 	    }
 
@@ -24151,8 +24273,12 @@ function requireCacheHandler () {
 	      ? parseHttpDate(resHeaders.date)
 	      : undefined;
 
+	    const hasValidator =
+	      (typeof resHeaders.etag === 'string' && isEtagUsable(resHeaders.etag)) ||
+	      typeof resHeaders['last-modified'] === 'string';
+
 	    const staleAt =
-	      determineStaleAt(this.#cacheType, now, resAge, resHeaders, resDate, cacheControlDirectives) ??
+	      determineStaleAt(this.#cacheType, now, resAge, resHeaders, resDate, cacheControlDirectives, hasValidator) ??
 	      this.#cacheByDefault;
 	    if (staleAt === undefined || (resAge && resAge > staleAt)) {
 	      return downstreamOnHeaders()
@@ -24160,7 +24286,11 @@ function requireCacheHandler () {
 
 	    const baseTime = resDate ? resDate.getTime() : now;
 	    const absoluteStaleAt = staleAt + baseTime;
-	    if (now >= absoluteStaleAt) {
+	    // Zero freshness lifetime but a validator: stale from the start, yet still
+	    //  storable since each reuse is preceded by a revalidation request.
+	    //  https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4
+	    const revalidationOnly = staleAt === 0 && hasValidator;
+	    if (now >= absoluteStaleAt && !revalidationOnly) {
 	      // Response is already stale
 	      return downstreamOnHeaders()
 	    }
@@ -24315,6 +24445,58 @@ function requireCacheHandler () {
 	    }
 	  }
 
+	  /**
+	   * Deletes the cache entries for the URIs in the response's Location and
+	   * Content-Location headers when they share the request URI's origin
+	   *  https://www.rfc-editor.org/rfc/rfc9111.html#section-4.4
+	   *
+	   * @param {import('../../types/header.d.ts').IncomingHttpHeaders} resHeaders
+	   */
+	  #deleteLocationHeaderEntries (resHeaders) {
+	    let requestUrl;
+	    try {
+	      requestUrl = new URL(this.#cacheKey.path, this.#cacheKey.origin);
+	    } catch {
+	      // Can't resolve the request URI, don't invalidate anything else
+	      return
+	    }
+
+	    const invalidatedPaths = new Set([this.#cacheKey.path]);
+
+	    for (const headerName of ['location', 'content-location']) {
+	      const header = resHeaders[headerName];
+	      const value = Array.isArray(header) ? header[0] : header;
+	      if (typeof value !== 'string' || value === '') {
+	        continue
+	      }
+
+	      let url;
+	      try {
+	        url = new URL(value, requestUrl);
+	      } catch {
+	        continue
+	      }
+
+	      if (url.origin !== requestUrl.origin) {
+	        // Only invalidate URIs sharing the request URI's origin, invalidating
+	        //  cross-origin URIs could be used for cache poisoning
+	        continue
+	      }
+
+	      const path = `${url.pathname}${url.search}`;
+	      if (invalidatedPaths.has(path)) {
+	        continue
+	      }
+	      invalidatedPaths.add(path);
+
+	      try {
+	        this.#store.delete({ ...this.#cacheKey, path })?.catch?.(noop);
+	      } catch {
+	        // Fail silently
+	      }
+	    }
+	  }
+
 	  onResponseData (controller, chunk) {
 	    if (this.#writeStream?.write(chunk) === false) {
 	      controller.pause();
@@ -24423,23 +24605,35 @@ function requireCacheHandler () {
 	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} resHeaders
 	 * @param {Date | undefined} responseDate
 	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives} cacheControlDirectives
+	 * @param {boolean} hasValidator whether the response has a validator (etag or
+	 *  last-modified) that revalidation requests can be made with
 	 *
 	 * @returns {number | undefined} time that the value is stale at in seconds or undefined if it shouldn't be cached
 	 */
-	function determineStaleAt (cacheType, now, age, resHeaders, responseDate, cacheControlDirectives) {
+	function determineStaleAt (cacheType, now, age, resHeaders, responseDate, cacheControlDirectives, hasValidator) {
 	  if (cacheType === 'shared') {
 	    // Prioritize s-maxage since we're a shared cache
 	    //  s-maxage > max-age > Expire
 	    //  https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.10-3
 	    const sMaxAge = cacheControlDirectives['s-maxage'];
 	    if (sMaxAge !== undefined) {
-	      return sMaxAge > 0 ? sMaxAge * 1000 : undefined
+	      if (sMaxAge > 0) {
+	        return sMaxAge * 1000
+	      }
+
+	      // Immediately stale, but storable if we can revalidate it before reuse.
+	      return sMaxAge === 0 && hasValidator ? 0 : undefined
 	    }
 	  }
 
 	  const maxAge = cacheControlDirectives['max-age'];
 	  if (maxAge !== undefined) {
-	    return maxAge > 0 ? maxAge * 1000 : undefined
+	    if (maxAge > 0) {
+	      return maxAge * 1000
+	    }
+
+	    // Immediately stale, but storable if we can revalidate it before reuse.
+	    return maxAge === 0 && hasValidator ? 0 : undefined
 	  }
 
 	  if (typeof resHeaders.expires === 'string') {
@@ -24483,6 +24677,12 @@ function requireCacheHandler () {
 	    return 31536000000
 	  }
 
+	  if (cacheControlDirectives['no-cache'] === true && hasValidator) {
+	    // No freshness source, but a validator lets us revalidate before reuse.
+	    //  https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.4
+	    return 0
+	  }
+
 	  return undefined
 	}
 
@@ -24519,6 +24719,11 @@ function requireCacheHandler () {
 	  // revalidated.
 	  if (staleWhileRevalidate === -Infinity && staleIfError === -Infinity && immutable === -Infinity) {
 	    const freshnessLifetime = staleAt - baseTime;
+	    if (freshnessLifetime <= 0) {
+	      // Revalidation-only entry: no freshness lifetime to size the buffer on,
+	      //  so retain it for a bounded window instead.
+	      return cachedAt + REVALIDATION_ONLY_RETENTION
+	    }
 	    const datePrecisionPadding = Math.min(Math.max(cachedAt - baseTime, 0), 1000);
 	    return staleAt + freshnessLifetime + datePrecisionPadding
 	  }
@@ -24946,6 +25151,16 @@ function requireCacheRevalidationHandler () {
 	    }
 
 	    if (this.#callback) {
+	      // Serve the stale cached response on a connection error, per stale-if-error:
+	      //  RFC 5861 counts an unreachable origin (a would-be 5xx) as an error.
+	      // https://datatracker.ietf.org/doc/html/rfc5861#section-4
+	      if (this.#allowErrorStatusCodes) {
+	        this.#successful = true;
+	        this.#callback(true, this.#context);
+	        this.#callback = null;
+	        return
+	      }
+
 	      this.#callback(false);
 	      this.#callback = null;
 	    }
@@ -25027,15 +25242,32 @@ function requireCache$1 () {
 	}
 
 	/**
+	 * must-revalidate (proxy-revalidate for shared caches) forbids serving a stale
+	 * response without successful validation, overriding max-stale and stale-if-error.
+	 * https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.2
+	 * https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.8
 	 * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
-	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives | undefined} cacheControlDirectives
+	 * @param {'shared' | 'private'} cacheType
 	 * @returns {boolean}
 	 */
-	function isStale (result, cacheControlDirectives) {
+	function forbidsServingStale (result, cacheType) {
+	  return Boolean(
+	    result.cacheControlDirectives?.['must-revalidate'] ||
+	    (cacheType === 'shared' && result.cacheControlDirectives?.['proxy-revalidate'])
+	  )
+	}
+
+	/**
+	 * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives | undefined} cacheControlDirectives
+	 * @param {'shared' | 'private'} cacheType
+	 * @returns {boolean}
+	 */
+	function isStale (result, cacheControlDirectives, cacheType) {
 	  const now = Date.now();
 	  if (now > result.staleAt) {
 	    // Response is stale
-	    if (cacheControlDirectives?.['max-stale']) {
+	    if (cacheControlDirectives?.['max-stale'] && !forbidsServingStale(result, cacheType)) {
 	      // There's a threshold where we can serve stale responses, let's see if
 	      //  we're in it
 	      // https://www.rfc-editor.org/rfc/rfc9111.html#name-max-stale
@@ -25255,7 +25487,7 @@ function requireCache$1 () {
 	    return dispatch(opts, handler)
 	  }
 
-	  const stale = isStale(result, reqCacheControl);
+	  const stale = isStale(result, reqCacheControl, globalOpts.type);
 	  const revalidate = needsRevalidation(result, reqCacheControl, opts);
 
 	  // Check if the response is stale
@@ -25314,7 +25546,7 @@ function requireCache$1 () {
 
 	    let withinStaleIfErrorThreshold = false;
 	    const staleIfErrorExpiry = result.cacheControlDirectives['stale-if-error'] ?? reqCacheControl?.['stale-if-error'];
-	    if (staleIfErrorExpiry) {
+	    if (staleIfErrorExpiry && !forbidsServingStale(result, globalOpts.type)) {
 	      withinStaleIfErrorThreshold = now < (result.staleAt + (staleIfErrorExpiry * 1000));
 	    }
 
@@ -25761,6 +25993,10 @@ function requireDecompress () {
 
 	  return (dispatch) => {
 	    return (opts, handler) => {
+	      if (opts.method === 'HEAD') {
+	        return dispatch(opts, handler)
+	      }
+
 	      const decompressHandler = new DecompressHandler(handler, options);
 	      return dispatch(opts, decompressHandler)
 	    }
@@ -27612,9 +27848,7 @@ function requireResponse () {
 	  static json (data, init = undefined) {
 	    webidl.argumentLengthCheck(arguments, 1, 'Response.json');
 
-	    if (init !== null) {
-	      init = webidl.converters.ResponseInit(init);
-	    }
+	    init = webidl.converters.ResponseInit(init);
 
 	    // 1. Let bytes the result of running serialize a JavaScript value to JSON bytes on data.
 	    const bytes = textEncoder.encode(
