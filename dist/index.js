@@ -44033,7 +44033,7 @@ function _getGlobal(key, defaultValue) {
 const toolName = 'vals';
 const githubRepository = 'helmfile/vals';
 // renovate: github=helmfile/vals
-const defaultVersion = 'v0.44.5';
+const defaultVersion = 'v0.45.0';
 function binaryName(version, os, arch) {
     version = semverExports.clean(version) || version;
     return `${toolName}_${version}_${os}_${arch}.tar.gz`;
