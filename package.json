@@ -52,14 +52,14 @@
     "husky": "9.1.7",
     "jest": "30.4.2",
     "prettier": "3.9.6",
-    "rollup": "4.62.2",
+    "rollup": "4.62.3",
     "semantic-release": "25.0.8",
     "ts-jest": "29.4.12",
     "ts-jest-resolver": "2.0.1",
     "typescript": "6.0.3"
   },
   "optionalDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "4.62.2"
+    "@rollup/rollup-linux-x64-gnu": "4.62.3"
   },
   "overrides": {
     "undici": "8.9.0"
