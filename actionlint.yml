@@ -1,6 +1,12 @@
 # See: https://github.com/rhysd/actionlint/blob/v1.7.7/docs/config.md
 
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
+
 paths:
   .github/workflows/**/*.{yml,yaml}:
     ignore:
       - invalid runner name "node24"
+      - 'specifying action "\$/" in invalid format'
