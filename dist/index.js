@@ -32,8 +32,8 @@ import require$$1$2 from 'node:sqlite';
 import require$$0$5 from 'node:buffer';
 import require$$4 from 'node:tls';
 import require$$11 from 'node:stream/web';
-import require$$0$6 from 'node:url';
 import require$$1$3 from 'node:async_hooks';
+import require$$0$6 from 'node:url';
 import require$$1$4 from 'node:console';
 import require$$0$7 from 'node:fs/promises';
 import require$$1$5 from 'node:path';
@@ -15133,6 +15133,12 @@ function requireClientH2 () {
 	// event loop.
 	const MAX_GOAWAY_REPLAY_ATTEMPTS = 1;
 
+	// Lower bound on how long a liveness PING may take to be acked. Stream
+	// timeouts can be tiny (tens of ms), while an ack on a live connection can take
+	// longer than that on a loaded event loop; without a floor a slow but healthy
+	// connection would be torn down.
+	const MIN_PROBE_TIMEOUT = 1e3;
+
 	let extractBody;
 
 	/** @type {import('http2')} */
@@ -15349,6 +15355,9 @@ function requireClientH2 () {
 	    // Armed while the peer advertises MAX_CONCURRENT_STREAMS = 0 and we have
 	    // work that cannot start. See setNoStreamsTimeout.
 	    noStreamsTimeout: null,
+	    // Armed while a PING checks whether the peer is still there after a
+	    // stream timed out. See probeHttp2Session.
+	    probeTimeout: null,
 	    // Sockets start out ref'd. Session ref/unref proxies to the socket, so a
 	    // single cached flag lets us skip redundant uv ref/unref calls, provided
 	    // every ref/unref of the session or its socket goes through
@@ -15430,6 +15439,11 @@ function requireClientH2 () {
 	    */
 	    busy (request) {
 	      if (session[kRemoteSettings] === false && client[kRunning] > 0) {
+	        return true
+	      }
+
+	      // Do not open streams on a connection that may be dead.
+	      if (session[kHTTP2SessionState].probeTimeout != null) {
 	        return true
 	      }
 
@@ -15562,6 +15576,60 @@ function requireClientH2 () {
 
 	  // Drop the unusable session so the next request gets a fresh connection,
 	  // whose SETTINGS may well allow streams again.
+	  session[kError] = err;
+	  resetHttp2Session(session, err);
+	}
+
+	// A stream timeout only resets that stream, unlike HTTP/1.1 which destroys the
+	// socket. If the connection itself silently died (dropped by a NAT or load
+	// balancer, a hung peer), every new stream would time out in turn and the
+	// session would never be replaced. Ask the peer for a PING ack within the
+	// timeout that just fired (but at least MIN_PROBE_TIMEOUT): if it answers, only
+	// that request was slow; if not, drop the session so queued requests move to a
+	// fresh connection.
+	function probeHttp2Session (session, timeout) {
+	  const state = session[kHTTP2SessionState];
+
+	  if (state.probeTimeout != null || session.closed || session.destroyed) {
+	    return
+	  }
+
+	  try {
+	    session.ping(onHttp2ProbeAck.bind(session));
+	  } catch {
+	    // The session is going away on its own.
+	    return
+	  }
+
+	  state.probeTimeout = setTimeout(onHttp2ProbeTimeout, Math.max(timeout, MIN_PROBE_TIMEOUT), session).unref();
+	}
+
+	function clearHttp2ProbeTimeout (session) {
+	  const state = session[kHTTP2SessionState];
+
+	  if (state?.probeTimeout != null) {
+	    clearTimeout(state.probeTimeout);
+	    state.probeTimeout = null;
+	  }
+	}
+
+	function onHttp2ProbeAck () {
+	  if (this[kHTTP2SessionState].probeTimeout == null) {
+	    return
+	  }
+
+	  clearHttp2ProbeTimeout(this);
+	  this[kClient][kResume]();
+	}
+
+	function onHttp2ProbeTimeout (session) {
+	  session[kHTTP2SessionState].probeTimeout = null;
+
+	  if (session.closed || session.destroyed) {
+	    return
+	  }
+
+	  const err = new SocketError('HTTP/2: connection unresponsive', util.getSocketInfo(session[kSocket]));
 	  session[kError] = err;
 	  resetHttp2Session(session, err);
 	}
@@ -15758,6 +15826,7 @@ function requireClientH2 () {
 
 	  clearHttp2IdleTimeout(this);
 	  clearNoStreamsTimeout(this);
+	  clearHttp2ProbeTimeout(this);
 
 	  if (!this.closed && !this.destroyed) {
 	    this.close();
@@ -15783,6 +15852,7 @@ function requireClientH2 () {
 
 	  clearHttp2IdleTimeout(this);
 	  clearNoStreamsTimeout(this);
+	  clearHttp2ProbeTimeout(this);
 
 	  if (state.ping.interval != null) {
 	    clearInterval(state.ping.interval);
@@ -16682,9 +16752,14 @@ function requireClientH2 () {
 	  // Remove self so timeout doesn't fire again after we handle it
 	  stream.off('timeout', onTimeout);
 
-	  const err = state.responseReceived
-	    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${state.bodyTimeout}"`)
-	    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${state.headersTimeout}"`);
+	  const { responseReceived, session, bodyTimeout, headersTimeout } = state;
+	  const err = responseReceived
+	    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${bodyTimeout}"`)
+	    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${headersTimeout}"`);
+
+	  // Probe before aborting: completing the request resumes the queue, which
+	  // must not open new streams until the peer has proven it is alive.
+	  probeHttp2Session(session, responseReceived ? bodyTimeout : headersTimeout);
 	  state.abort(err);
 	}
 
@@ -17835,6 +17910,7 @@ function requirePoolBase () {
 	if (hasRequiredPoolBase) return poolBase;
 	hasRequiredPoolBase = 1;
 
+	const { AsyncResource } = require$$1$3;
 	const { PoolStats } = requireStats();
 	const DispatcherBase = requireDispatcherBase();
 	const FixedQueue = requireFixedQueue();
@@ -17861,6 +17937,22 @@ function requirePoolBase () {
 	// Closes every live client, including clients that have been
 	// taken out of rotation but are still finishing their own
 	// requests.
+	// Requests that wait in the Pool queue are dispatched later from whichever
+	// callback drains the queue (another request's connect, drain, ...). Capture
+	// the caller's async context so Client#dispatch, and the diagnostics channel
+	// events it publishes, still run in it.
+	class QueuedRequest extends AsyncResource {
+	  constructor (opts, handler) {
+	    super('UNDICI_POOL_QUEUED_REQUEST');
+	    this.opts = opts;
+	    this.handler = handler;
+	  }
+
+	  dispatch (dispatcher) {
+	    return this.runInAsyncScope(dispatcher.dispatch, dispatcher, this.opts, this.handler)
+	  }
+	}
+
 	function closeClients (pool) {
 	  const closeAll = [];
 	  for (let i = 0; i < pool[kClients].length; i++) {
@@ -17904,7 +17996,7 @@ function requirePoolBase () {
 	        break
 	      }
 	      this[kQueued]--;
-	      needDrain = !client.dispatch(item.opts, item.handler);
+	      needDrain = !item.dispatch(client);
 	    }
 
 	    client[kNeedDrain] = needDrain;
@@ -17949,7 +18041,7 @@ function requirePoolBase () {
 	      const item = queue.shift();
 	      this[kQueued]--;
 
-	      if (!dispatcher.dispatch(item.opts, item.handler)) {
+	      if (!item.dispatch(dispatcher)) {
 	        dispatcher[kNeedDrain] = true;
 	        this[kOnClientBusy](dispatcher);
 	        hasDispatcher = this[kHasDispatcher]();
@@ -18063,7 +18155,7 @@ function requirePoolBase () {
 
 	    if (!dispatcher) {
 	      this[kNeedDrain] = true;
-	      this[kQueue].push({ opts, handler });
+	      this[kQueue].push(new QueuedRequest(opts, handler));
 	      this[kQueued]++;
 	    } else if (!dispatcher.dispatch(opts, handler)) {
 	      dispatcher[kNeedDrain] = true;
@@ -50337,7 +50429,7 @@ function _getGlobal(key, defaultValue) {
 const toolName = 'vals';
 const githubRepository = 'helmfile/vals';
 // renovate: github=helmfile/vals
-const defaultVersion = 'v0.47.0';
+const defaultVersion = 'v0.50.0';
 function binaryName(version, os, arch) {
     version = semverExports.clean(version) || version;
     return `${toolName}_${version}_${os}_${arch}.tar.gz`;
