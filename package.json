@@ -39,11 +39,11 @@
     "@jest/globals": "30.5.2",
     "@rollup/plugin-commonjs": "29.0.3",
     "@rollup/plugin-node-resolve": "16.0.3",
-    "@rollup/plugin-typescript": "12.3.0",
+    "@rollup/plugin-typescript": "12.3.1",
     "@types/jest": "30.0.0",
     "@types/node": "24.19.2",
     "@types/semver": "7.8.0",
-    "@typescript-eslint/eslint-plugin": "8.71.2",
+    "@typescript-eslint/eslint-plugin": "8.72.0",
     "cross-env": "10.1.0",
     "eslint": "10.13.0",
     "eslint-config-prettier": "10.1.8",
@@ -52,14 +52,14 @@
     "husky": "9.1.7",
     "jest": "30.5.2",
     "prettier": "3.9.10",
-    "rollup": "4.64.7",
+    "rollup": "4.65.0",
     "semantic-release": "25.0.9",
     "ts-jest": "29.4.15",
     "ts-jest-resolver": "2.0.1",
     "typescript": "6.0.3"
   },
   "optionalDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "4.64.7"
+    "@rollup/rollup-linux-x64-gnu": "4.65.0"
   },
   "overrides": {
     "undici": "8.12.2"
