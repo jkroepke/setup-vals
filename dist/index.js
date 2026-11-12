@@ -10971,7 +10971,8 @@ function requireParserH1 () {
 	let miloPackage;
 
 	// We disable wasm SIMD on ppc64 as it seems to be broken on Power 9 architectures.
-	let useWasmSIMD = process.arch !== 'ppc64';
+	// We disable wasm SIMD on riscv64 as it seems to be broken on there as well.
+	let useWasmSIMD = (process.arch !== 'riscv64' && process.arch !== 'ppc64');
 	// The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior.
 	if (process.env.UNDICI_NO_WASM_SIMD === '1') {
 	  useWasmSIMD = false;
@@ -12878,16 +12879,36 @@ function requireBody () {
 	      )
 	    }
 
-	    stream = webidl.is.ReadableStream(object)
-	      ? object
-	      : ReadableStream.from(object).pipeThrough(new TransformStream({
-	        transform (chunk, controller) {
-	          const bytes = isUint8Array(chunk) ? chunk : Buffer.from(chunk);
-	          if (bytes.byteLength) {
-	            controller.enqueue(bytes);
+	    if (webidl.is.ReadableStream(object)) {
+	      stream = object;
+	    } else {
+	      const reader = ReadableStream.from(object).getReader();
+	      let cancelled = false;
+	      // Do not pull from the iterable until the body is read.
+	      stream = new ReadableStream({
+	        async pull (controller) {
+	          while (true) {
+	            const { done, value } = await reader.read();
+	            if (cancelled) {
+	              return
+	            }
+	            if (done) {
+	              controller.close();
+	              return
+	            }
+	            const bytes = isUint8Array(value) ? value : Buffer.from(value);
+	            if (bytes.byteLength) {
+	              controller.enqueue(bytes);
+	              return
+	            }
 	          }
+	        },
+	        cancel (reason) {
+	          cancelled = true;
+	          return reader.cancel(reason)
 	        }
-	      }));
+	      }, { highWaterMark: 0 });
+	    }
 	  }
 
 	  // 18. If source is a byte sequence, then set action to a
@@ -13303,7 +13324,9 @@ function requireClientH1 () {
 
 	  // We disable wasm SIMD on older versions of Node.js on ppc64 that are broken on Power >=9 architectures.
 	  let useWasmSIMD = true;
-	  if (process.arch === 'ppc64') {
+	  if (process.arch === 'riscv64') {
+	    useWasmSIMD = false;
+	  } else if (process.arch === 'ppc64') {
 	    const [major, minor] = process.versions.node.split('.').map(n => parseInt(n, 10));
 	    if (major < 24 || (major === 24 && minor < 12)) {
 	      useWasmSIMD = false;
@@ -15119,7 +15142,6 @@ function requireClientH2 () {
 	const { channels } = requireDiagnostics();
 
 	const kOpenStreams = Symbol('open streams');
-	const kRequestStreamId = Symbol('request stream id');
 	const kRequestStream = Symbol('request stream');
 	const kRequestStreamCleanup = Symbol('request stream cleanup');
 	const kRequestStreamState = Symbol('request stream state');
@@ -15132,6 +15154,9 @@ function requireClientH2 () {
 	// an unbounded connect/refuse/reconnect loop that never settles and starves the
 	// event loop.
 	const MAX_GOAWAY_REPLAY_ATTEMPTS = 1;
+
+	// RFC 9113 section 6.2. node:http2 reports frame types as raw numbers.
+	const HTTP2_FRAME_TYPE_HEADERS = 1;
 
 	// Lower bound on how long a liveness PING may take to be acked. Stream
 	// timeouts can be tiny (tens of ms), while an ack on a live connection can take
@@ -15205,7 +15230,9 @@ function requireClientH2 () {
 	      continue
 	    }
 
-	    if (typeof request[kRequestStreamId] !== 'number' || request[kRequestStreamId] > maxAcceptedStreamID) {
+	    // A pending stream may not have had an ID when it was bound to the request.
+	    const streamId = request[kRequestStream]?.id;
+	    if (typeof streamId !== 'number' || streamId > maxAcceptedStreamID) {
 	      return i
 	    }
 	  }
@@ -15214,7 +15241,6 @@ function requireClientH2 () {
 	}
 
 	function detachRequestFromStream (request) {
-	  request[kRequestStreamId] = null;
 	  request[kRequestStream] = null;
 	  request[kRequestStreamCleanup] = null;
 	}
@@ -15224,7 +15250,6 @@ function requireClientH2 () {
 	  const previousStream = request[kRequestStream];
 	  detachRequestFromStream(request);
 	  previousCleanup?.(previousStream);
-	  request[kRequestStreamId] = stream.id;
 	  request[kRequestStream] = stream;
 	  request[kRequestStreamCleanup] = cleanup;
 	}
@@ -15325,8 +15350,14 @@ function requireClientH2 () {
 	    closeStreamSession(stream);
 	  }
 
+	  // #5936: Node can still deliver a session-level error to a native stream
+	  // after undici has stopped tracking it (e.g. on idle session teardown). Keep
+	  // a persistent noop error sink so the 'error' event is never emitted with no
+	  // listener, which would crash the process. A single sink is enough even if
+	  // one was already attached by the onError path, so clear it first.
 	  if (!stream.destroyed && !stream.closed) {
-	    stream.once('error', noop);
+	    stream.off('error', noop);
+	    stream.on('error', noop);
 	  }
 	}
 
@@ -15804,15 +15835,17 @@ function requireClientH2 () {
 	    }
 	  }
 
-	  for (let i = 0; i < streamsToClose.length; i++) {
-	    closeStream(streamsToClose[i]);
-	  }
-
 	  if (pendingIdx !== previousPendingIdx) {
 	    const remainingPendingRequests = client[kQueue].slice(previousPendingIdx);
 	    client[kQueue].length = pendingIdx;
 	    client[kQueue].push(...retriableRequests, ...remainingPendingRequests);
 	  }
+
+	  // Publish the rebuilt queue and detach the session before closing anything.
+	  // A synchronous sibling HEADERS frameError can requeue an accepted-but-unsent
+	  // request and resume the client. It must see the final indices and must not
+	  // dispatch its retry on the session that is being retired.
+	  client[kPendingIdx] = pendingIdx;
 
 	  if (client[kHTTP2Session] === this) {
 	    client[kSocket] = null;
@@ -15828,11 +15861,13 @@ function requireClientH2 () {
 	  clearNoStreamsTimeout(this);
 	  clearHttp2ProbeTimeout(this);
 
+	  for (let i = 0; i < streamsToClose.length; i++) {
+	    closeStream(streamsToClose[i]);
+	  }
+
 	  if (!this.closed && !this.destroyed) {
 	    this.close();
 	  }
-
-	  client[kPendingIdx] = pendingIdx;
 
 	  client.emit('disconnect', client[kUrl], [client], err);
 
@@ -15940,8 +15975,8 @@ function requireClientH2 () {
 	}
 
 	function onUpgradeStreamClose () {
-	  this.off('error', noop);
-
+	  // #5936: Retain the noop error sink so a session-level error delivered to
+	  // this stream after undici detaches it cannot crash via an unhandled 'error'.
 	  const state = this[kRequestStreamState];
 	  this[kRequestStreamState] = null;
 
@@ -16045,8 +16080,11 @@ function requireClientH2 () {
 
 	  removeUpgradeStreamListeners(stream);
 
+	  // #5936: removeUpgradeStreamListeners() dropped the noop sink; re-attach a
+	  // persistent one so a late session-level error on this (possibly still native
+	  // tracked) stream cannot crash via an unhandled 'error'.
 	  if (!stream.destroyed && !stream.closed) {
-	    stream.once('error', noop);
+	    stream.on('error', noop);
 	  }
 	}
 
@@ -16479,12 +16517,14 @@ function requireClientH2 () {
 	    detachRequestFromStream(request);
 	  }
 
-	  // A closed or destroyed stream cannot emit further events; leaving the
-	  // listeners in place saves the removal scans (they are collected with
-	  // the stream). All handlers bail out when the stream state is gone.
+	  // #5936: Node can deliver a session-level error to a released stream before
+	  // its native handle is dropped (e.g. on idle session teardown). Attach a
+	  // persistent noop error sink so a late 'error' always has a listener and
+	  // cannot crash the process. A closed/destroyed stream cannot emit further
+	  // events and is no longer tracked natively, so skip the listener teardown.
 	  if (!stream.destroyed && !stream.closed) {
 	    removeRequestStreamListeners(stream);
-	    stream.once('error', noop);
+	    stream.on('error', noop);
 	  }
 	}
 
@@ -16679,10 +16719,43 @@ function requireClientH2 () {
 	  // SHOULD NOT automatically retry the same request more than once.
 	  request[kRefusedStreamRetry] = true;
 
+	  // The peer only reset this stream, so the HTTP/2 session remains usable for
+	  // the retry.
+	  requeueStreamRequest(client, state);
+
+	  return true
+	}
+
+	// nghttp2 refuses to send the HEADERS of a stream opened before a GOAWAY was
+	// received but flushed after it. The peer never saw the request, so it can be
+	// replayed on a new connection whatever its method. A GOAWAY whose
+	// lastStreamID covers the stream (e.g. 2^31-1, a graceful shutdown notice)
+	// leaves the stream attached to the session, so this is the only signal.
+	function retryUnsentStream (state) {
+	  const { client, request, session } = state;
+
+	  if (
+	    !session[kReceivedGoAway] ||
+	    state.responseReceived ||
+	    request.aborted ||
+	    request.completed ||
+	    !canReplayRequest(request) ||
+	    !registerGoAwayRefusal(request)
+	  ) {
+	    return false
+	  }
+
+	  requeueStreamRequest(client, state);
+
+	  return true
+	}
+
+	function requeueStreamRequest (client, state) {
+	  const { request } = state;
+
 	  // Detach the failed attempt before moving the request back to the pending
-	  // queue. The peer only reset this stream, so the HTTP/2 session remains
-	  // usable for the retry. Severing also drops the 'close' listener, so the
-	  // abandoned stream cannot later complete the retried request.
+	  // queue. Severing also drops the 'close' listener, so the abandoned stream
+	  // cannot later complete the retried request.
 	  detachRequestStreamForClose(request);
 	  state.stream = null;
 	  state.requestFinalized = true;
@@ -16690,8 +16763,6 @@ function requireClientH2 () {
 	  completeRequest(client, request);
 	  client[kQueue].splice(client[kPendingIdx], 0, request);
 	  client[kResume]();
-
-	  return true
 	}
 
 	function onError (err) {
@@ -16703,6 +16774,10 @@ function requireClientH2 () {
 	  }
 
 	  stream.off('error', onError);
+	  // #5936: The stream has already errored, but Node may destroy it again with a
+	  // session-level error before the native handle is released. Keep a persistent
+	  // noop error sink so that re-delivery cannot go unhandled.
+	  stream.on('error', noop);
 
 	  // Node's HTTP/2 implementation can turn an incomplete Content-Length body
 	  // into a protocol stream error instead of emitting 'end'. Prefer the
@@ -16734,6 +16809,11 @@ function requireClientH2 () {
 	  }
 
 	  stream.off('frameError', onFrameError);
+
+	  if (type === HTTP2_FRAME_TYPE_HEADERS && retryUnsentStream(state)) {
+	    return
+	  }
+
 	  state.abort(new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`));
 	}
 
@@ -23745,6 +23825,13 @@ function requireMockUtils () {
 	    return path
 	  }
 
+	  // Only strip slashes from the pathname, not from a query string after it
+	  const queryIndex = path.indexOf('?');
+	  const search = queryIndex === -1 ? '' : path.slice(queryIndex);
+	  if (queryIndex !== -1) {
+	    path = path.slice(0, queryIndex);
+	  }
+
 	  while (path.endsWith('/')) {
 	    path = path.slice(0, -1);
 	  }
@@ -23753,7 +23840,7 @@ function requireMockUtils () {
 	    path = '/';
 	  }
 
-	  return path
+	  return path + search
 	}
 
 	function buildKey (opts) {
@@ -23884,6 +23971,9 @@ function requireMockUtils () {
 	    paused: false,
 	    rawHeaders: null,
 	    rawTrailers: null,
+	    get aborted () {
+	      return aborted
+	    },
 	    pause () {
 	      this.paused = true;
 	    },
@@ -26492,9 +26582,13 @@ function requireDecoratorHandler () {
 	  onResponseStart (...args) {
 	    assert(!this.#onCompleteCalled);
 	    assert(!this.#onErrorCalled);
-	    assert(!this.#onResponseStartCalled);
 
-	    this.#onResponseStartCalled = true;
+	    // Interim 1xx responses (e.g. 103 Early Hints) come before the final one.
+	    const statusCode = args[1];
+	    if (statusCode >= 200) {
+	      assert(!this.#onResponseStartCalled);
+	      this.#onResponseStartCalled = true;
+	    }
 
 	    return this.#handler.onResponseStart?.(...args)
 	  }
@@ -26578,11 +26672,12 @@ function requireRedirectHandler () {
 	    this.maxRedirections = maxRedirections;
 	    this.handler = handler;
 	    this.history = [];
-	    // `cache-control` of each intermediate (suppressed) redirect hop. An outer
-	    // cache uses it to preserve a hop's storage policy (e.g. `no-store`) that
-	    // would otherwise be lost because the hop's response is not forwarded. It
-	    // travels as a non-enumerable property of the history array so it reaches
-	    // the cache without becoming part of the public request/response context.
+	    // Per-hop metadata for each intermediate (suppressed) redirect hop: the
+	    // hop's status code and response headers. An outer cache uses it to honor a
+	    // hop's storage policy (e.g. `no-store`, `no-cache`, `Vary: *`) that would
+	    // otherwise be lost because the hop's response is not forwarded. It travels
+	    // as a non-enumerable property of the history array so it reaches the cache
+	    // without becoming part of the public request/response context.
 	    Object.defineProperty(this.history, kRedirectCacheControl, {
 	      value: [],
 	      enumerable: false
@@ -26664,9 +26759,13 @@ function requireRedirectHandler () {
 	    }
 
 	    // This hop's response is suppressed (only its Location is used). Record its
-	    // cache-control so an outer cache can honor a restrictive policy that would
-	    // otherwise be lost when the final response is stored.
-	    this.history[kRedirectCacheControl].push(headers['cache-control']);
+	    // status and headers so an outer cache can honor a restrictive policy that
+	    // would otherwise be lost when the final response is stored.
+	    this.history[kRedirectCacheControl].push({
+	      statusCode,
+	      headers: { ...headers },
+	      receivedAt: Date.now()
+	    });
 
 	    const baseUrl = requestOrigin
 	      ? new URL(this.opts.path, requestOrigin)
@@ -26763,9 +26862,25 @@ function requireRedirectHandler () {
 	function cleanRequestHeaders (headers, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin) {
 	  const ret = [];
 	  if (Array.isArray(headers)) {
-	    for (let i = 0; i < headers.length; i += 2) {
-	      if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
-	        ret.push(headers[i], headers[i + 1]);
+	    // Headers may be either a flat alternating [name, value, name, value, ...]
+	    // list or an iterable of [name, value] pairs. A plain JavaScript array of
+	    // tuples (e.g. `Object.entries(headers)`) satisfies the iterable-of-pairs
+	    // public type, so we must distinguish the two representations before
+	    // iterating. Treating every Array as a flat list misreads each tuple as a
+	    // header name/value pair and defeats the cross-origin credential stripping.
+	    if (headers.length > 0 && Array.isArray(headers[0])) {
+	      // Array of [name, value] pairs.
+	      for (const [key, value] of headers) {
+	        if (!shouldRemoveHeader(key, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
+	          ret.push(key, value);
+	        }
+	      }
+	    } else {
+	      // Flat alternating [name, value, name, value, ...] list.
+	      for (let i = 0; i < headers.length; i += 2) {
+	        if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
+	          ret.push(headers[i], headers[i + 1]);
+	        }
 	      }
 	    }
 	  } else if (headers && typeof headers === 'object') {
@@ -29164,6 +29279,17 @@ function requireCacheHandler () {
 	  isInvalidOrWildcardVaryHeader,
 	  isEtagUsable
 	} = requireCache$2();
+
+	/**
+	 * A suppressed redirect hop recorded by the redirect handler. Carried on
+	 * {@link kRedirectCacheControl} and inspected by the cache handler before the
+	 * final response is stored under the original request key.
+	 *
+	 * @typedef {object} RedirectHop
+	 * @property {number} statusCode The hop's response status code (e.g. 302).
+	 * @property {import('../../types/header.d.ts').IncomingHttpHeaders} headers The hop's response headers.
+	 * @property {number} receivedAt The time the hop's response headers were received.
+	 */
 	const { parseHttpDate } = requireDate();
 
 	function noop () {}
@@ -29259,6 +29385,16 @@ function requireCacheHandler () {
 	  return false
 	}
 
+	function appendVaryValues (target, varyValue) {
+	  if (Array.isArray(varyValue)) {
+	    for (let i = 0; i < varyValue.length; i++) {
+	      target.push(varyValue[i]);
+	    }
+	  } else if (varyValue != null) {
+	    target.push(varyValue);
+	  }
+	}
+
 	function appendConnectionHeaderTokens (headersToRemove, connectionHeader) {
 	  const values = Array.isArray(connectionHeader) ? connectionHeader : [connectionHeader];
 
@@ -29330,6 +29466,26 @@ function requireCacheHandler () {
 	  deleteLocationTargets(store, cacheKey, resHeaders.location);
 	  deleteLocationTargets(store, cacheKey, resHeaders['content-location']);
 	}
+
+	/**
+	 * Whether the original request carried a credential that is not reflected in
+	 * the cache key. The memory/sqlite stores key an entry on origin, method, path
+	 * and `vary` only, so a credentialed request that is redirected to a resource
+	 * that varies per principal must not be stored under the original (alias) key:
+	 * a later caller would be served the first principal's body. The set mirrors the
+	 * request credentials the redirect handler strips across origins (`authorization`,
+	 * `cookie`, `proxy-authorization`).
+	 *
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders | undefined} headers
+	 * @returns {boolean}
+	 */
+	function requestCarriesCredentials (headers) {
+	  return headers != null && (
+	    Object.hasOwn(headers, 'authorization') ||
+	    Object.hasOwn(headers, 'cookie') ||
+	    Object.hasOwn(headers, 'proxy-authorization')
+	  )
+	}
 	/**
 	 * @typedef {import('../../types/dispatcher.d.ts').default.DispatchHandler} DispatchHandler
 	 *
@@ -29374,7 +29530,7 @@ function requireCacheHandler () {
 	  /**
 	   * The URLs visited while following redirects, shared by reference from the
 	   * redirect handler through the request context. Carries the suppressed hops'
-	   * cache-control under {@link kRedirectCacheControl}.
+	   * status/headers under {@link kRedirectCacheControl}.
 	   * @type {URL[] | undefined}
 	   */
 	  #history
@@ -29450,33 +29606,60 @@ function requireCacheHandler () {
 	      return downstreamOnHeaders()
 	    }
 
+	    // A credential-bearing request that was redirected must not have the final
+	    // hop's response stored under the original request's key. The cache key
+	    // does not include the credential, and the redirect target may vary per
+	    // principal (e.g. `/me` -> `/profile/{user}`), so replaying the body under
+	    // the alias key would leak one principal's data to another — or to an
+	    // unauthenticated caller — from a shared cache. The final hop's permissive
+	    // cache-control (e.g. `public`) does not authorize this: the credential was
+	    // presented to the original hop, not the resource that actually produced
+	    // the body. Fail closed. A history with more than one entry means at least
+	    // one redirect was actually followed (a single non-redirected hop records
+	    // exactly one entry), so a plain revalidation is not mistaken for a redirect.
+	    if (
+	      this.#history && this.#history.length > 1 &&
+	      requestCarriesCredentials(this.#cacheKey.headers)
+	    ) {
+	      return downstreamOnHeaders()
+	    }
+
 	    // A cross-origin redirect can change the origin that actually produced the
 	    // final response. Keying that response on the original (trusted) origin
 	    // would let a redirect target control an entry for a URL the application
-	    // trusts. The final request is the last URL in the redirect history; only
-	    // cache when its origin still matches the cache key origin.
+	    // trusts. Every hop in the redirect chain must stay on the cache key's
+	    // origin. An intermediate cross-origin hop can bounce back to the trusted
+	    // origin (or to any cacheable asset there) even when the final response
+	    // comes from the trusted origin, so checking only the final URL is not
+	    // enough.
 	    if (this.#history && this.#history.length > 0) {
-	      const finalUrl = this.#history[this.#history.length - 1];
-	      if (!sameOrigin(finalUrl.origin, this.#cacheKey.origin)) {
-	        return downstreamOnHeaders()
-	      }
-	    }
-
-	    // A redirect hop that is not forwarded can still carry a restrictive
-	    // storage policy (for example `no-store`, or `private` for a shared cache).
-	    // Honor it, otherwise a redirect that must not be stored could be laundered
-	    // into a cacheable final response under the original key.
-	    const redirectCacheControl = this.#history?.[kRedirectCacheControl];
-	    if (redirectCacheControl) {
-	      for (const hopCacheControl of redirectCacheControl) {
-	        const hopDirectives = hopCacheControl ? parseCacheControlHeader(hopCacheControl) : {};
-	        if (
-	          hopDirectives['no-store'] === true ||
-	          (this.#cacheType === 'shared' && hopDirectives.private === true)
-	        ) {
+	      for (const hopUrl of this.#history) {
+	        if (!sameOrigin(hopUrl.origin, this.#cacheKey.origin)) {
 	          return downstreamOnHeaders()
 	        }
 	      }
+	    }
+
+	    // A redirect hop that is not forwarded can still carry a storage policy
+	    // (for example `no-store`, `private` for a shared cache, `no-cache`,
+	    // `must-revalidate`, zero freshness, or `Vary: *`) that the final response
+	    // body does not inherit. Honor it, otherwise a redirect that must not be
+	    // stored (or that selects a private/authenticated target) could be
+	    // laundered into a cacheable final response under the original key.
+	    const now = Date.now();
+	    const redirectHopInfo = this.#history?.[kRedirectCacheControl];
+	    const redirectPolicy = redirectHopInfo?.length > 0
+	      ? getRedirectPolicy(
+	        this.#cacheType,
+	        this.#cacheKey.method,
+	        redirectHopInfo,
+	        this.#cacheKey.headers,
+	        this.#cacheByDefault,
+	        now
+	      )
+	      : undefined;
+	    if (redirectHopInfo?.length > 0 && redirectPolicy === undefined) {
+	      return downstreamOnHeaders()
 	    }
 
 	    const cacheControlHeader = resHeaders['cache-control'];
@@ -29511,7 +29694,6 @@ function requireCacheHandler () {
 	      return downstreamOnHeaders()
 	    }
 
-	    const now = Date.now();
 	    const resAge = Object.hasOwn(resHeaders, 'age') ? getAge(resHeaders.age) : undefined;
 	    if (resAge !== undefined && resAge >= MAX_RESPONSE_AGE) {
 	      // Response considered stale
@@ -29548,24 +29730,65 @@ function requireCacheHandler () {
 	    }
 
 	    const baseTime = now - currentAge;
-	    const absoluteStaleAt = staleAt + baseTime;
+	    let absoluteStaleAt = staleAt + baseTime;
+	    if (redirectPolicy !== undefined) {
+	      absoluteStaleAt = Math.min(absoluteStaleAt, redirectPolicy.staleAt);
+	    }
 	    if (now >= absoluteStaleAt && !revalidationOnly) {
 	      // Response is already stale
 	      deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey);
 	      return downstreamOnHeaders()
 	    }
 
+	    // Union the `Vary` of every suppressed redirect hop with the final
+	    // response's `Vary`. A 3xx hop that negotiates its target on `Authorization`
+	    // / `Cookie` (or any other header) must make the stored entry vary on those
+	    // headers too, or an authenticated user's private response would be served
+	    // to unrelated callers.
 	    let varyDirectives;
-	    if (this.#cacheKey.headers && resHeaders.vary) {
-	      varyDirectives = parseVaryHeader(resHeaders.vary, this.#cacheKey.headers);
-	      if (!varyDirectives) {
-	        // Parse error
-	        return downstreamOnHeaders()
+	    const combinedVary = [];
+	    if (redirectHopInfo) {
+	      for (const hop of redirectHopInfo) {
+	        appendVaryValues(combinedVary, hop?.headers?.vary);
+	      }
+	    }
+	    appendVaryValues(combinedVary, resHeaders.vary);
+	    if (combinedVary.length > 0) {
+	      for (const varyHeader of combinedVary) {
+	        if (hasVaryStar(varyHeader)) {
+	          // `Vary: *` means the response can never be reused (RFC 9111 §4.1)
+	          return downstreamOnHeaders()
+	        }
+	      }
+	      if (this.#cacheKey.headers) {
+	        varyDirectives = parseVaryHeader(combinedVary, this.#cacheKey.headers);
+	        if (!varyDirectives) {
+	          // Parse error
+	          return downstreamOnHeaders()
+	        }
+	      }
+	    }
+
+	    // When the entry was folded from a redirect chain, the final response's
+	    // stale-serving directives (RFC 5861) must not outlive the hops' freshness.
+	    // A hop that grants no `stale-while-revalidate` / `stale-if-error` caps
+	    // stale serving at its freshness, so the final response cannot launder a
+	    // stale-serving window past the hop-bounded `staleAt`. Drop those directives
+	    // (and keep the `proxy-revalidate` the hop policy may require) so the entry
+	    // revalidates at `staleAt` instead of being served stale for the final
+	    // response's window.
+	    let effectiveCacheControlDirectives = cacheControlDirectives;
+	    if (redirectPolicy !== undefined) {
+	      effectiveCacheControlDirectives = { ...cacheControlDirectives };
+	      delete effectiveCacheControlDirectives['stale-while-revalidate'];
+	      delete effectiveCacheControlDirectives['stale-if-error'];
+	      if (redirectPolicy.requiresRevalidation === true) {
+	        effectiveCacheControlDirectives['proxy-revalidate'] = true;
 	      }
 	    }
 
 	    const cachedAt = baseTime;
-	    const deleteAt = determineDeleteAt(baseTime, now, cacheControlDirectives, absoluteStaleAt);
+	    const deleteAt = determineDeleteAt(baseTime, now, effectiveCacheControlDirectives, absoluteStaleAt);
 	    const strippedHeaders = stripNecessaryHeaders(resHeaders, cacheControlDirectives);
 
 	    /**
@@ -29576,7 +29799,7 @@ function requireCacheHandler () {
 	      statusMessage,
 	      headers: strippedHeaders,
 	      vary: varyDirectives,
-	      cacheControlDirectives,
+	      cacheControlDirectives: effectiveCacheControlDirectives,
 	      cachedAt,
 	      staleAt: absoluteStaleAt,
 	      deleteAt
@@ -29592,6 +29815,22 @@ function requireCacheHandler () {
 	        }
 	        done = true;
 	        this.#downstreamController.release();
+	      };
+
+	      // The cached body below is replayed to the downstream handler from later
+	      // stream ticks (or an iterator loop), outside the dispatcher's own error
+	      // handling, so a throwing downstream handler must be converged to a
+	      // per-request error instead of escaping as an uncaught exception.
+	      const failReplay = (err) => {
+	        if (done) {
+	          return
+	        }
+	        done = true;
+	        // Abort the revalidation request: this releases the paused origin
+	        // response (freeing the connection) and routes the error through
+	        // CacheHandler.onResponseError, which destroys the cache write stream
+	        // and forwards the error downstream exactly once.
+	        controller.abort(err);
 	      };
 
 	      const handle304 = (cachedValue) => {
@@ -29625,15 +29864,19 @@ function requireCacheHandler () {
 	            if (done) {
 	              return
 	            }
-	            for (const chunk of bodyIterator) {
-	              const full = this.#writeStream?.write(chunk) === false;
-	              this.#handler.onResponseData?.(this.#downstreamController, chunk);
-	              // when stream is full stop writing until we get a 'drain' event
-	              if (full) {
-	                return
+	            try {
+	              for (const chunk of bodyIterator) {
+	                const full = this.#writeStream?.write(chunk) === false;
+	                this.#handler.onResponseData?.(this.#downstreamController, chunk);
+	                // when stream is full stop writing until we get a 'drain' event
+	                if (full) {
+	                  return
+	                }
 	              }
+	              finish304();
+	            } catch (err) {
+	              failReplay(err);
 	            }
-	            finish304();
 	          };
 
 	          this.#writeStream
@@ -29659,8 +29902,13 @@ function requireCacheHandler () {
 	          // Readable stream body (e.g. from async/remote cache stores)
 	          cachedValue.body
 	            .on('data', (chunk) => {
-	              this.#writeStream?.write(chunk);
-	              this.#handler.onResponseData?.(this.#downstreamController, chunk);
+	              try {
+	                this.#writeStream?.write(chunk);
+	                this.#handler.onResponseData?.(this.#downstreamController, chunk);
+	              } catch (err) {
+	                cachedValue.body.destroy();
+	                failReplay(err);
+	              }
 	            })
 	            .on('end', () => {
 	              this.#writeStream?.end();
@@ -29865,6 +30113,139 @@ function requireCacheHandler () {
 	  }
 
 	  return true
+	}
+
+	/**
+	 * Determine the absolute freshness deadline imposed by all suppressed redirect
+	 * hops. Returning `undefined` means at least one hop cannot safely be folded
+	 * into the final response under the original request key.
+	 *
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+	 * @param {string} method
+	 * @param {RedirectHop[]} redirectHops
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} reqHeaders
+	 * @param {number | undefined} cacheByDefault
+	 * @param {number} now
+	 * @returns {{ staleAt: number, requiresRevalidation: boolean } | undefined}
+	 */
+	function getRedirectPolicy (cacheType, method, redirectHops, reqHeaders, cacheByDefault, now) {
+	  let staleAt = Infinity;
+	  let requiresRevalidation = false;
+
+	  for (const hop of redirectHops) {
+	    const hopPolicy = getRedirectHopPolicy(cacheType, method, hop, reqHeaders, cacheByDefault);
+	    if (hopPolicy === undefined || hopPolicy.staleAt <= now) {
+	      return undefined
+	    }
+
+	    staleAt = Math.min(staleAt, hopPolicy.staleAt);
+	    requiresRevalidation ||= hopPolicy.requiresRevalidation;
+	  }
+
+	  return { staleAt, requiresRevalidation }
+	}
+
+	/**
+	 * Calculate one redirect hop's absolute freshness deadline using the same age,
+	 * date, expiration, invalid-directive, and heuristic rules as a final response.
+	 *
+	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+	 * @param {string} method
+	 * @param {RedirectHop} hop
+	 * @param {import('../../types/header.d.ts').IncomingHttpHeaders} reqHeaders
+	 * @param {number | undefined} cacheByDefault
+	 * @returns {{ staleAt: number, requiresRevalidation: boolean } | undefined}
+	 */
+	function getRedirectHopPolicy (cacheType, method, hop, reqHeaders, cacheByDefault) {
+	  if (!Number.isInteger(hop?.statusCode) || !Number.isFinite(hop?.receivedAt)) {
+	    return undefined
+	  }
+
+	  const hopHeaders = hop.headers ?? {};
+	  const cacheControlHeader = hopHeaders['cache-control'];
+	  const hopCacheControl = cacheControlHeader
+	    ? parseCacheControlHeader(cacheControlHeader)
+	    : {};
+
+	  // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1-5
+	  if (hopHeaders.vary && hasVaryStar(hopHeaders.vary)) {
+	    return undefined
+	  }
+
+	  if (hopCacheControl['no-store'] === true) {
+	    return undefined
+	  }
+
+	  // A qualified `private` directive still marks the named fields as private.
+	  // Folding a redirect that says `private="location"` would preserve the
+	  // private target choice in the final body even though a shared cache is not
+	  // allowed to store that Location field.
+	  if (cacheType === 'shared' && Object.hasOwn(hopCacheControl, 'private')) {
+	    return undefined
+	  }
+
+	  // These directives require the hop to be revalidated before reuse. Since the
+	  // cache stores only the final response, it cannot independently validate the
+	  // suppressed redirect response.
+	  if (
+	    Object.hasOwn(hopCacheControl, 'no-cache') ||
+	    hopCacheControl['must-revalidate'] === true ||
+	    (cacheType === 'shared' && hopCacheControl['proxy-revalidate'] === true)
+	  ) {
+	    return undefined
+	  }
+
+	  const heuristicallyCacheable =
+	    hopHeaders['last-modified'] &&
+	    arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, hop.statusCode);
+	  if (
+	    !cacheControlHeader &&
+	    !hopHeaders.expires &&
+	    !heuristicallyCacheable &&
+	    !cacheByDefault
+	  ) {
+	    return undefined
+	  }
+
+	  if (!canCacheResponse(cacheType, method, hop.statusCode, hopHeaders, hopCacheControl, reqHeaders)) {
+	    return undefined
+	  }
+
+	  const age = Object.hasOwn(hopHeaders, 'age') ? getAge(hopHeaders.age) : undefined;
+	  if (age !== undefined && age >= MAX_RESPONSE_AGE) {
+	    return undefined
+	  }
+
+	  const responseDate = Object.hasOwn(hopHeaders, 'date') ? getDate(hopHeaders.date) : undefined;
+	  if (responseDate === null) {
+	    return undefined
+	  }
+
+	  const apparentAge = responseDate ? Math.max(0, hop.receivedAt - responseDate.getTime()) : 0;
+	  const currentAge = Math.max(apparentAge, age ?? 0);
+	  const hasValidator =
+	    (typeof hopHeaders.etag === 'string' && isEtagUsable(hopHeaders.etag)) ||
+	    typeof hopHeaders['last-modified'] === 'string';
+	  const freshnessLifetime =
+	    determineStaleAt(
+	      cacheType,
+	      hop.receivedAt,
+	      age,
+	      hopHeaders,
+	      responseDate,
+	      hopCacheControl,
+	      hasValidator
+	    ) ?? cacheByDefault;
+
+	  if (freshnessLifetime === undefined) {
+	    return undefined
+	  }
+
+	  return {
+	    staleAt: hop.receivedAt - currentAge + freshnessLifetime,
+	    // RFC 9111 §5.2.2.10: s-maxage implies proxy-revalidate for shared caches.
+	    requiresRevalidation: cacheType === 'shared' && Object.hasOwn(hopCacheControl, 's-maxage')
+	  }
 	}
 
 	/**
@@ -30596,7 +30977,8 @@ function requireCache$1 () {
 	  normalizeHeaders,
 	  parseCacheControlHeader,
 	  isInvalidOrWildcardVaryHeader,
-	  parseVaryHeader
+	  parseVaryHeader,
+	  isEtagUsable
 	} = requireCache$2();
 	const { AbortError } = requireErrors();
 	const { parseHttpDate } = requireDate();
@@ -30784,6 +31166,47 @@ function requireCache$1 () {
 	  return headers
 	}
 
+	function revalidationTargetMatchesCacheKey (cacheKey, context) {
+	  const history = context?.history;
+	  if (!Array.isArray(history) || history.length === 0) {
+	    return true
+	  }
+
+	  try {
+	    const cachedUrl = new URL(cacheKey.path, cacheKey.origin);
+	    const responseUrl = history[history.length - 1];
+	    return responseUrl.origin === cachedUrl.origin &&
+	      responseUrl.pathname === cachedUrl.pathname &&
+	      responseUrl.search === cachedUrl.search
+	  } catch {
+	    return false
+	  }
+	}
+
+	function revalidationEtagMatchesCachedValue (result, headers) {
+	  if (!Object.hasOwn(headers, 'etag')) {
+	    return true
+	  }
+
+	  const responseEtag = headers.etag;
+	  const cachedEtag = result.etag;
+	  if (
+	    typeof responseEtag !== 'string' ||
+	    typeof cachedEtag !== 'string' ||
+	    !isEtagUsable(responseEtag) ||
+	    !isEtagUsable(cachedEtag)
+	  ) {
+	    return false
+	  }
+
+	  if (!responseEtag.startsWith('W/')) {
+	    return responseEtag === cachedEtag
+	  }
+
+	  const cachedOpaqueTag = cachedEtag.startsWith('W/') ? cachedEtag.slice(2) : cachedEtag;
+	  return responseEtag.slice(2) === cachedOpaqueTag
+	}
+
 	/**
 	 * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
 	 * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives | undefined} cacheControlDirectives
@@ -30948,21 +31371,35 @@ function requireCache$1 () {
 
 	  stream
 	    .on('error', function (err) {
+	      // Never rethrow: this runs from a stream event on a later tick, where a
+	      // throw would crash the process. Like core's Request.onResponseError,
+	      // the error is dropped if the handler has no onResponseError.
 	      if (!this.readableEnded) {
-	        if (typeof handler.onResponseError === 'function') {
-	          handler.onResponseError(controller, err);
-	        } else {
-	          throw err
-	        }
+	        handler.onResponseError?.(controller, err);
 	      }
 	    })
 	    .on('close', function () {
 	      if (!this.errored) {
-	        handler.onResponseEnd?.(controller, {});
+	        try {
+	          handler.onResponseEnd?.(controller, {});
+	        } catch (err) {
+	          // The stream is already closed, so the error can't be routed
+	          // through it; report it to the handler directly instead.
+	          handler.onResponseError?.(controller, err);
+	        }
 	      }
 	    });
 
-	  handler.onRequestStart?.(controller, context);
+	  // Downstream handler calls below run outside the dispatcher's own error
+	  // handling (on later ticks for the body, or inside a promise callback for
+	  // async stores), so a throw must be converged to a per-request error
+	  // instead of escaping as an uncaught exception.
+	  try {
+	    handler.onRequestStart?.(controller, context);
+	  } catch (err) {
+	    stream.destroy(err);
+	    return
+	  }
 
 	  if (stream.destroyed) {
 	    return
@@ -30980,13 +31417,22 @@ function requireCache$1 () {
 
 	  controller.rawHeaders = util.toRawHeaders(headers);
 
-	  handler.onResponseStart?.(controller, result.statusCode, headers, result.statusMessage);
+	  try {
+	    handler.onResponseStart?.(controller, result.statusCode, headers, result.statusMessage);
+	  } catch (err) {
+	    stream.destroy(err);
+	    return
+	  }
 
 	  if (opts.method === 'HEAD') {
 	    stream.destroy();
 	  } else {
 	    stream.on('data', function (chunk) {
-	      handler.onResponseData?.(controller, chunk);
+	      try {
+	        handler.onResponseData?.(controller, chunk);
+	      } catch (err) {
+	        stream.destroy(err);
+	      }
 	    });
 	  }
 	}
@@ -31084,6 +31530,14 @@ function requireCache$1 () {
 	    }
 
 	    const headers = makeRevalidationHeaders(opts, result);
+	    const refetch = () => {
+	      if (util.isStream(result.body)) {
+	        result.body.on('error', nop).destroy();
+	      }
+
+	      deleteCachedValue(globalOpts.store, cacheKey);
+	      return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+	    };
 
 	    // We need to revalidate the response
 	    return dispatch(
@@ -31095,24 +31549,18 @@ function requireCache$1 () {
 	        (success, context, statusCode, headers) => {
 	          if (success) {
 	            if (statusCode === 304) {
-	              if (revalidationResponseDisallowsCachedReuse(globalOpts.type, headers)) {
-	                if (util.isStream(result.body)) {
-	                  result.body.on('error', nop).destroy();
-	                }
-
-	                deleteCachedValue(globalOpts.store, cacheKey);
-	                return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+	              if (
+	                !revalidationTargetMatchesCacheKey(cacheKey, context) ||
+	                !revalidationEtagMatchesCachedValue(result, headers) ||
+	                revalidationResponseDisallowsCachedReuse(globalOpts.type, headers)
+	              ) {
+	                return refetch()
 	              }
 
 	              if (revalidationResponseUpdatesCacheControl(headers)) {
 	                deleteCachedValue(globalOpts.store, cacheKey);
 	              } else if (revalidationResponseAddsVary(result, headers.vary ? parseVaryHeader(headers.vary, opts.headers) : undefined)) {
-	                if (util.isStream(result.body)) {
-	                  result.body.on('error', nop).destroy();
-	                }
-
-	                deleteCachedValue(globalOpts.store, cacheKey);
-	                return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+	                return refetch()
 	              }
 	            }
 
@@ -31248,6 +31696,28 @@ function requireCache$1 () {
 	            reqCacheControl,
 	            result
 	          ))
+	          .catch((err) => {
+	            // Any throw escaping handleResult on the async-store path (e.g. a
+	            // rejection from store.get() itself, or a throw in a code path not
+	            // converged by sendCachedValue) would otherwise surface as an
+	            // unhandled promise rejection and crash the process. Route it to
+	            // the handler instead, matching the synchronous store path where
+	            // the error propagates to the request() call site.
+	            if (typeof handler.onResponseError === 'function') {
+	              handler.onResponseError({
+	                rawHeaders: [],
+	                rawTrailers: [],
+	                pause () {},
+	                resume () {},
+	                get paused () { return false },
+	                get aborted () { return false },
+	                get reason () { return null },
+	                abort () {}
+	              }, err);
+	            } else {
+	              throw err
+	            }
+	          })
 	      } else {
 	        return handleResult(
 	          dispatch,
@@ -32534,7 +33004,9 @@ function requireSqliteCacheStore () {
 
 	let DatabaseSync;
 
-	const VERSION = 4;
+	// Bump when entries written by an older cache policy are unsafe to reuse.
+	// Version 5 invalidates entries that may have been poisoned through redirects.
+	const VERSION = 5;
 
 	// 2gb
 	const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000;
@@ -32545,6 +33017,20 @@ function requireSqliteCacheStore () {
 	// zstd support landed in Node 22.19.0/23.4.0, so it may be missing even when
 	// node:sqlite is available.
 	const hasZstd = typeof zstdCompressSync === 'function' && typeof zstdDecompressSync === 'function';
+
+	// SQLite reports a database that another connection is writing as SQLITE_BUSY
+	// (5) or SQLITE_LOCKED (6).
+	// https://www.sqlite.org/rescode.html#busy
+	const SQLITE_BUSY = 5;
+	const SQLITE_LOCKED = 6;
+
+	/**
+	 * @param {Error & { errcode?: number }} err
+	 * @returns {boolean}
+	 */
+	function isLockedError (err) {
+	  return err?.errcode === SQLITE_BUSY || err?.errcode === SQLITE_LOCKED
+	}
 
 	/**
 	 * @typedef {import('../../types/cache-interceptor.d.ts').default.CacheStore} CacheStore
@@ -32787,7 +33273,7 @@ function requireSqliteCacheStore () {
 	  get (key) {
 	    assertCacheKey(key);
 
-	    const value = this.#findValue(key);
+	    const value = this.#lockSafe(() => this.#findValue(key));
 	    return value
 	      ? {
 	          body: value.body
@@ -32835,10 +33321,10 @@ function requireSqliteCacheStore () {
 	      }
 	    }
 
-	    const existingValue = this.#findValue(key, true);
+	    const existingValue = this.#lockSafe(() => this.#findValue(key, true));
 	    if (existingValue) {
 	      // Updating an existing response, let's overwrite it
-	      this.#updateValueQuery.run(
+	      this.#lockSafe(() => this.#updateValueQuery.run(
 	        storedBody,
 	        compressed,
 	        value.deleteAt,
@@ -32851,10 +33337,10 @@ function requireSqliteCacheStore () {
 	        value.cachedAt,
 	        value.staleAt,
 	        existingValue.id
-	      );
+	      ));
 	    } else {
 	      // New response, let's insert it
-	      this.#insertValueQuery.run(
+	      this.#lockSafe(() => this.#insertValueQuery.run(
 	        url,
 	        key.method,
 	        storedBody,
@@ -32868,7 +33354,7 @@ function requireSqliteCacheStore () {
 	        value.vary ? JSON.stringify(value.vary) : null,
 	        value.cachedAt,
 	        value.staleAt
-	      );
+	      ));
 	      this.#prune();
 	    }
 	  }
@@ -32917,23 +33403,53 @@ function requireSqliteCacheStore () {
 	      throw new TypeError(`expected key to be object, got ${typeof key}`)
 	    }
 
-	    this.#deleteByUrlQuery.run(this.#makeValueUrl(key));
+	    this.#lockSafe(() => this.#deleteByUrlQuery.run(this.#makeValueUrl(key)));
+	  }
+
+	  /**
+	   * Runs a database operation, skipping it when another connection holds the
+	   * database lock.
+	   *
+	   * The cache store is meant to be shared between processes, and SQLite reports
+	   * a concurrent writer as SQLITE_BUSY/SQLITE_LOCKED. Those errors are
+	   * transient, and caching is best effort: the entry is skipped and the next
+	   * request retries, rather than failing the request that triggered the write.
+	   *
+	   * @template T
+	   * @param {() => T} fn
+	   * @returns {T | undefined}
+	   */
+	  #lockSafe (fn) {
+	    try {
+	      return fn()
+	    } catch (err) {
+	      if (!isLockedError(err)) {
+	        throw err
+	      }
+
+	      return undefined
+	    }
 	  }
 
 	  #prune () {
-	    if (Number.isFinite(this.#maxCount) && this.size <= this.#maxCount) {
-	      return 0
+	    if (Number.isFinite(this.#maxCount)) {
+	      // A locked database cannot be measured, so skip pruning instead of
+	      // failing the write that triggered it.
+	      const size = this.#lockSafe(() => this.size);
+	      if (size === undefined || size <= this.#maxCount) {
+	        return 0
+	      }
 	    }
 
 	    {
-	      const removed = this.#deleteExpiredValuesQuery.run(Date.now()).changes;
+	      const removed = this.#lockSafe(() => this.#deleteExpiredValuesQuery.run(Date.now()).changes);
 	      if (removed) {
 	        return removed
 	      }
 	    }
 
 	    {
-	      const removed = this.#deleteOldValuesQuery?.run(Math.max(Math.floor(this.#maxCount * 0.1), 1)).changes;
+	      const removed = this.#lockSafe(() => this.#deleteOldValuesQuery?.run(Math.max(Math.floor(this.#maxCount * 0.1), 1)).changes);
 	      if (removed) {
 	        return removed
 	      }
@@ -34483,60 +34999,98 @@ function requireRequest () {
 	const { URLSerializer } = requireDataUrl();
 	const { kConstruct } = requireSymbols();
 	const assert = require$$0$1;
-	const { getMaxListeners, setMaxListeners, defaultMaxListeners } = require$$0;
 
-	const kAbortController = Symbol('abortController');
-
-	const requestFinalizer = new FinalizationRegistry(({ signal, abort }) => {
-	  signal.removeEventListener('abort', abort);
+	const requestFinalizer = new FinalizationRegistry(({ signal, reference }) => {
+	  removeSignalFollower(signal, reference);
 	});
 
-	const dependentControllerMap = new WeakMap();
+	/**
+	 * @typedef {object} RequestSignalState
+	 * @property {AbortController} controller
+	 * @property {AbortSignal} source
+	 * @property {WeakRef<AbortController>} reference
+	 */
 
-	let abortSignalHasEventHandlerLeakWarning;
+	/** @type {WeakMap<AbortSignal, RequestSignalState>} */
+	const requestSignals = new WeakMap();
 
-	try {
-	  abortSignalHasEventHandlerLeakWarning = getMaxListeners(new AbortController().signal) > 0;
-	} catch {
-	  abortSignalHasEventHandlerLeakWarning = false;
+	/** @type {WeakMap<AbortSignal, WeakRef<AbortController> | Set<WeakRef<AbortController>>>} */
+	const signalFollowers = new WeakMap();
+
+	/**
+	 * @param {AbortSignal} signal
+	 * @param {WeakRef<AbortController>} reference
+	 */
+	function removeSignalFollower (signal, reference) {
+	  const followers = signalFollowers.get(signal);
+	  if (followers instanceof Set) {
+	    followers.delete(reference);
+	    if (followers.size !== 0) return
+	  }
+
+	  signal.removeEventListener('abort', abortSignalFollowers);
+	  signalFollowers.delete(signal);
 	}
 
-	function buildAbort (acRef) {
-	  return abort
-
-	  function abort () {
-	    const ac = acRef.deref();
-	    if (ac !== undefined) {
-	      // Currently, there is a problem with FinalizationRegistry.
-	      // https://github.com/nodejs/node/issues/49344
-	      // https://github.com/nodejs/node/issues/47748
-	      // In the case of abort, the first step is to unregister from it.
-	      // If the controller can refer to it, it is still registered.
-	      // It will be removed in the future.
-	      requestFinalizer.unregister(abort);
-
-	      // Unsubscribe a listener.
-	      // FinalizationRegistry will no longer be called, so this must be done.
-	      this.removeEventListener('abort', abort);
-
-	      ac.abort(this.reason);
-
-	      const controllerList = dependentControllerMap.get(ac.signal);
-
-	      if (controllerList !== undefined) {
-	        if (controllerList.size !== 0) {
-	          for (const ref of controllerList) {
-	            const ctrl = ref.deref();
-	            if (ctrl !== undefined) {
-	              ctrl.abort(this.reason);
-	            }
-	          }
-	          controllerList.clear();
-	        }
-	        dependentControllerMap.delete(ac.signal);
-	      }
-	    }
+	/**
+	 * @param {WeakRef<AbortController>} reference
+	 * @param {unknown} reason
+	 */
+	function abortSignalFollower (reference, reason) {
+	  requestFinalizer.unregister(reference);
+	  const ac = reference.deref();
+	  if (ac !== undefined) {
+	    requestSignals.delete(ac.signal);
+	    ac.abort(reason);
 	  }
+	}
+
+	/** @this {AbortSignal} */
+	function abortSignalFollowers () {
+	  this.removeEventListener('abort', abortSignalFollowers);
+	  const followers = signalFollowers.get(this);
+	  if (followers instanceof Set) {
+	    for (const reference of followers) {
+	      abortSignalFollower(reference, this.reason);
+	    }
+	    followers.clear();
+	  } else {
+	    abortSignalFollower(followers, this.reason);
+	  }
+	  signalFollowers.delete(this);
+	}
+
+	/**
+	 * @param {AbortSignal | null | undefined} signal
+	 */
+	function createDependentSignal (signal) {
+	  const ac = new AbortController();
+	  if (signal == null) return ac.signal
+
+	  if (signal.aborted) {
+	    ac.abort(signal.reason);
+	    return ac.signal
+	  }
+
+	  const reference = new WeakRef(ac);
+	  const followers = signalFollowers.get(signal);
+	  if (followers === undefined) {
+	    util.addAbortListener(signal, abortSignalFollowers);
+	    signalFollowers.set(signal, reference);
+	  } else if (followers instanceof WeakRef) {
+	    const controllers = new Set();
+	    controllers.add(followers);
+	    controllers.add(reference);
+	    signalFollowers.set(signal, controllers);
+	  } else {
+	    followers.add(reference);
+	  }
+
+	  requestFinalizer.register(ac, { signal, reference }, reference);
+
+	  // The signal must keep its controller alive even after its Request is collected.
+	  requestSignals.set(ac.signal, { controller: ac, source: signal, reference });
+	  return ac.signal
 	}
 
 	let patchMethodWarning = false;
@@ -34554,13 +35108,6 @@ function requireRequest () {
 	  #headers
 
 	  #state
-
-	  /**
-	   * Removes the `abort` listener that makes this request's signal follow the
-	   * passed signal. `null` when no such listener was registered.
-	   * @type {(() => void) | null}
-	   */
-	  #abortCleanup = null
 
 	  // https://fetch.spec.whatwg.org/#dom-request
 	  constructor (input, init = undefined) {
@@ -34875,51 +35422,8 @@ function requireRequest () {
 	    // 27. Set this’s request to request.
 	    this.#state = request;
 
-	    // 28. Set this’s signal to a new AbortSignal object with this’s relevant
-	    // Realm.
-	    // TODO: could this be simplified with AbortSignal.any
-	    // (https://dom.spec.whatwg.org/#dom-abortsignal-any)
-	    const ac = new AbortController();
-	    this.#signal = ac.signal;
-
-	    // 29. If signal is not null, then make this’s signal follow signal.
-	    if (signal != null) {
-	      if (signal.aborted) {
-	        ac.abort(signal.reason);
-	      } else {
-	        // Keep a strong ref to ac while request object
-	        // is alive. This is needed to prevent AbortController
-	        // from being prematurely garbage collected.
-	        // See, https://github.com/nodejs/undici/issues/1926.
-	        this[kAbortController] = ac;
-
-	        const acRef = new WeakRef(ac);
-	        const abort = buildAbort(acRef);
-
-	        // If the max amount of listeners is equal to the default, increase it
-	        if (abortSignalHasEventHandlerLeakWarning && getMaxListeners(signal) === defaultMaxListeners) {
-	          setMaxListeners(1500, signal);
-	        }
-
-	        const removeAbortListener = util.addAbortListener(signal, abort);
-	        // The third argument must be a registry key to be unregistered.
-	        // Without it, you cannot unregister.
-	        // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/FinalizationRegistry
-	        // abort is used as the unregister key. (because it is unique)
-	        requestFinalizer.register(ac, { signal, abort }, abort);
-
-	        // Allow the listener to be removed deterministically once the fetch
-	        // that owns this request has settled, instead of relying solely on the
-	        // FinalizationRegistry (i.e. garbage collection). Reusing a single
-	        // signal across many requests would otherwise leak listeners.
-	        // See https://github.com/nodejs/undici/issues/5285
-	        this.#abortCleanup = () => {
-	          requestFinalizer.unregister(abort);
-	          removeAbortListener();
-	          this.#abortCleanup = null;
-	        };
-	      }
-	    }
+	    // 28-29. Create a signal that follows the supplied signal, if any.
+	    this.#signal = createDependentSignal(signal);
 
 	    // 30. Set this’s headers to a new Headers object with this’s relevant
 	    // Realm, whose header list is request’s header list and guard is
@@ -35249,25 +35753,10 @@ function requireRequest () {
 	    // 3. Let clonedRequestObject be the result of creating a Request object,
 	    // given clonedRequest, this’s headers’s guard, and this’s relevant Realm.
 	    // 4. Make clonedRequestObject’s signal follow this’s signal.
-	    const ac = new AbortController();
-	    if (this.signal.aborted) {
-	      ac.abort(this.signal.reason);
-	    } else {
-	      let list = dependentControllerMap.get(this.signal);
-	      if (list === undefined) {
-	        list = new Set();
-	        dependentControllerMap.set(this.signal, list);
-	      }
-	      const acRef = new WeakRef(ac);
-	      list.add(acRef);
-	      util.addAbortListener(
-	        ac.signal,
-	        buildAbort(acRef)
-	      );
-	    }
+	    const signal = createDependentSignal(this.#signal);
 
 	    // 4. Return clonedRequestObject.
-	    return fromInnerRequest(clonedRequest, this.#dispatcher, ac.signal, getHeadersGuard(this.#headers))
+	    return fromInnerRequest(clonedRequest, this.#dispatcher, signal, getHeadersGuard(this.#headers))
 	  }
 
 	  [nodeUtil.inspect.custom] (depth, options) {
@@ -35351,7 +35840,12 @@ function requireRequest () {
 	     * @param {Request} request
 	     */
 	    removeRequestAbortListener = (request) => {
-	      request.#abortCleanup?.();
+	      const state = requestSignals.get(request.#signal);
+	      if (state !== undefined) {
+	        requestSignals.delete(request.#signal);
+	        requestFinalizer.unregister(state.reference);
+	        removeSignalFollower(state.source, state.reference);
+	      }
 	    };
 
 	    webidl.is.Request = (arg) => {
@@ -35801,8 +36295,8 @@ function requireSubresourceIntegrity () {
 	  /** @type {MetadataList} */
 	  const result = [];
 
-	  // 2. For each item returned by splitting metadata on spaces:
-	  for (const item of metadata.split(' ')) {
+	  // 2. For each item returned by splitting metadata on ASCII whitespace:
+	  for (const item of metadata.split(/[\t\n\f\r ]+/)) {
 	    // 1. Let expression-and-options be the result of splitting item on U+003F (?).
 	    const expressionAndOptions = item.split('?', 1);
 
@@ -36207,10 +36701,7 @@ function requireFetch () {
 	      cleanupAbortListeners();
 	    },
 	    processResponse,
-	    dispatcher: getRequestDispatcher(requestObject), // undici
-	    // Keep requestObject alive to prevent its AbortController from being GC'd
-	    // See https://github.com/nodejs/undici/issues/4627
-	    requestObject
+	    dispatcher: getRequestDispatcher(requestObject) // undici
 	  });
 
 	  // 14. Return p.
@@ -36329,8 +36820,7 @@ function requireFetch () {
 	  processResponseEndOfBody,
 	  processResponseConsumeBody,
 	  useParallelQueue = false,
-	  dispatcher = getGlobalDispatcher(), // undici
-	  requestObject = null // Keep alive to prevent AbortController GC, see #4627
+	  dispatcher = getGlobalDispatcher() // undici
 	}) {
 	  // Ensure that the dispatcher is set accordingly
 	  assert(dispatcher);
@@ -36384,9 +36874,7 @@ function requireFetch () {
 	    processResponseConsumeBody,
 	    processResponseEndOfBody,
 	    taskDestination,
-	    crossOriginIsolatedCapability,
-	    // Keep requestObject alive to prevent its AbortController from being GC'd
-	    requestObject
+	    crossOriginIsolatedCapability
 	  };
 
 	  // 7. If request’s body is a byte sequence, then set request’s body to
@@ -47230,6 +47718,35 @@ function requireConstants () {
 	// the shortest version with a build 0.0.0+BUILD.
 	const MAX_SAFE_BUILD_LENGTH = MAX_LENGTH - 6;
 
+	// ECMAScript whitespace and line terminators matched by \s.
+	const WHITESPACE_CHARACTERS = [
+	  '\t',
+	  '\n',
+	  '\v',
+	  '\f',
+	  '\r',
+	  ' ',
+	  '\u00a0',
+	  '\u1680',
+	  '\u2000',
+	  '\u2001',
+	  '\u2002',
+	  '\u2003',
+	  '\u2004',
+	  '\u2005',
+	  '\u2006',
+	  '\u2007',
+	  '\u2008',
+	  '\u2009',
+	  '\u200a',
+	  '\u2028',
+	  '\u2029',
+	  '\u202f',
+	  '\u205f',
+	  '\u3000',
+	  '\ufeff',
+	];
+
 	const RELEASE_TYPES = [
 	  'major',
 	  'premajor',
@@ -47245,6 +47762,7 @@ function requireConstants () {
 	  MAX_SAFE_COMPONENT_LENGTH,
 	  MAX_SAFE_BUILD_LENGTH,
 	  MAX_SAFE_INTEGER,
+	  WHITESPACE_CHARACTERS,
 	  RELEASE_TYPES,
 	  SEMVER_SPEC_VERSION,
 	  FLAG_INCLUDE_PRERELEASE: 0b001,
@@ -48534,6 +49052,451 @@ function requireLrucache () {
 	return lrucache;
 }
 
+var trimComparatorWhitespace_1;
+var hasRequiredTrimComparatorWhitespace;
+
+function requireTrimComparatorWhitespace () {
+	if (hasRequiredTrimComparatorWhitespace) return trimComparatorWhitespace_1;
+	hasRequiredTrimComparatorWhitespace = 1;
+
+	// Reproduce safeRe[COMPARATORTRIM] replacement boundaries, not version
+	// validation. Each end-index finder returns an exclusive end, or its start
+	// on no match.
+	// Positions count from zero. An end of 3 means characters 0, 1, and 2 were read;
+	// range.slice(start, end) gives the matched text, not a converted number.
+	const {
+	  MAX_LENGTH,
+	  MAX_SAFE_BUILD_LENGTH,
+	  WHITESPACE_CHARACTERS,
+	} = requireConstants();
+
+	/**
+	 * Remembers the last two rows of digits so their characters need not be reread.
+	 * Positions start at -1 until a row has been found.
+	 *
+	 * @typedef {object} DigitRunCache
+	 * @property {number} start The first character of the most recently found row.
+	 * @property {number} end The position after that row's last character.
+	 * @property {number} previousStart The first character of the previous row.
+	 * @property {number} previousEnd The position after the previous row.
+	 */
+
+	// One entry per UTF-16 code unit keeps membership checks constant-time.
+	const whitespace = new Uint8Array(0x10000);
+	for (const char of WHITESPACE_CHARACTERS) {
+	  whitespace[char.charCodeAt(0)] = 1;
+	}
+
+	/**
+	 * Checks whether a character is whitespace, like a space, tab, or newline.
+	 * Looking past the end of the string returns false.
+	 *
+	 * @param {string|undefined} char One character, or undefined past the string's end.
+	 * @returns {boolean} Whether the character is whitespace.
+	 * @example isWhitespace(' ') // true
+	 * @example isWhitespace('1') // false
+	 */
+	const isWhitespace = char =>
+	  char !== undefined && whitespace[char.charCodeAt(0)] === 1;
+
+	/**
+	 * Checks for v, =, or whitespace before the version number.
+	 * These are historical version prefixes, not range operators:
+	 * < and > are handled separately, as are tilde and caret ranges.
+	 *
+	 * @param {string|undefined} char One character to check.
+	 * @returns {boolean} Whether the character can belong to a version prefix.
+	 * @example isVersionPrefix('=') // true
+	 * @example isVersionPrefix('>') // false
+	 */
+	const isVersionPrefix = char =>
+	  char === 'v' ||
+	  char === '=' ||
+	  isWhitespace(char);
+
+	/**
+	 * Checks whether a character is one of the digits 0 through 9.
+	 *
+	 * @param {string|undefined} char One character to check.
+	 * @returns {boolean} Whether the character is an ASCII digit.
+	 * @example isDigit('7') // true
+	 * @example isDigit('.') // false
+	 */
+	const isDigit = char => char !== undefined && char >= '0' && char <= '9';
+
+	/**
+	 * Checks whether a character is an English letter, uppercase or lowercase.
+	 *
+	 * @param {string|undefined} char One character to check.
+	 * @returns {boolean} Whether the character is an ASCII letter.
+	 * @example isLetter('b') // true
+	 * @example isLetter('7') // false
+	 */
+	const isLetter = char =>
+	  char !== undefined && (
+	    (char >= 'a' && char <= 'z') ||
+	    (char >= 'A' && char <= 'Z')
+	  );
+
+	/**
+	 * Checks for a letter, digit, or hyphen: the characters allowed inside
+	 * prerelease and build names such as beta-1.
+	 *
+	 * @param {string|undefined} char One character to check.
+	 * @returns {boolean} Whether the character can be part of an identifier.
+	 * @example isIdentifierCharacter('-') // true
+	 * @example isIdentifierCharacter('.') // false; dots separate identifiers
+	 */
+	const isIdentifierCharacter = char => isDigit(char) || isLetter(char) || char === '-';
+
+	/**
+	 * Checks whether a version component can begin here: with a digit or
+	 * a wildcard such as x, X, or *.
+	 *
+	 * @param {string|undefined} char One character to check.
+	 * @returns {boolean} Whether a number or wildcard can start with this character.
+	 * @example isVersionStart('x') // true
+	 * @example isVersionStart('v') // false; v belongs to the prefix
+	 */
+	const isVersionStart = char =>
+	  isDigit(char) ||
+	  char === 'x' ||
+	  char === 'X' ||
+	  char === '*';
+
+	/**
+	 * Finds the end of a row of digits, but returns no more than limit digits.
+	 * Remembers the last two rows so looking at them again does not reread them.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position of the first character to check.
+	 * @param {number} limit The most digit characters the returned match can include.
+	 * @param {DigitRunCache} digitRuns Shared cache of digit-run positions, updated in place.
+	 * @returns {number} The position after the matched digits, or start if none match.
+	 * @example findDigitsEndIndex('123abc', 0, 10, digitRuns) // 3, pointing at a
+	 * @example findDigitsEndIndex('123abc', 0, 2, digitRuns) // 2, pointing at the unread 3
+	 */
+	const findDigitsEndIndex = (range, start, limit, digitRuns) => {
+	  if (!isDigit(range[start])) {
+	    return start
+	  }
+	  if (start >= digitRuns.start && start < digitRuns.end) {
+	    return Math.min(start + limit, digitRuns.end)
+	  }
+	  if (start >= digitRuns.previousStart && start < digitRuns.previousEnd) {
+	    return Math.min(start + limit, digitRuns.previousEnd)
+	  }
+	  let end = start + 1;
+	  while (isDigit(range[end])) {
+	    end++;
+	  }
+	  // A failed full version can rewind from its second run to its first.
+	  digitRuns.previousStart = digitRuns.start;
+	  digitRuns.previousEnd = digitRuns.end;
+	  digitRuns.start = start;
+	  digitRuns.end = end;
+	  return Math.min(start + limit, end)
+	};
+
+	/**
+	 * Reads a number using the old regex's length and leading-zero rules.
+	 * Strict mode reads just the first zero in 012; loose mode can read all three.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position where the number should begin.
+	 * @param {boolean} loose Whether to allow leading zeros.
+	 * @param {DigitRunCache} digitRuns Shared digit-run cache, updated as needed.
+	 * @returns {number} The position after the matched digits, not their numeric value.
+	 * @example findVersionNumberEndIndex('012', 0, false, digitRuns) // 1
+	 * @example findVersionNumberEndIndex('012', 0, true, digitRuns) // 3
+	 */
+	const findVersionNumberEndIndex = (range, start, loose, digitRuns) => {
+	  if (!loose && range[start] === '0') {
+	    return start + 1
+	  }
+	  // Strict syntax allows an initial nonzero digit plus MAX_LENGTH digits.
+	  return findDigitsEndIndex(range, start, loose ? MAX_LENGTH : MAX_LENGTH + 1, digitRuns)
+	};
+
+	/**
+	 * Reads one piece of a prerelease name, such as beta or 1 in beta.1.
+	 * Tries the letter-or-hyphen form first, then the number-only form.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position where the identifier should begin.
+	 * @param {boolean} loose Whether numeric identifiers may have leading zeros.
+	 * @param {DigitRunCache} digitRuns Shared digit-run cache, updated as needed.
+	 * @returns {number} The position after the identifier, or start if none matches.
+	 * @example findPrereleaseIdentifierEndIndex('beta.1', 0, false, digitRuns) // 4, at the dot
+	 * @example findPrereleaseIdentifierEndIndex('001beta', 0, false, digitRuns) // 7
+	 */
+	const findPrereleaseIdentifierEndIndex = (range, start, loose, digitRuns) => {
+	  const digitsEnd = findDigitsEndIndex(range, start, MAX_LENGTH, digitRuns);
+	  // The legacy regex tries a nonnumeric identifier before a numeric one.
+	  if (isLetter(range[digitsEnd]) || range[digitsEnd] === '-') {
+	    let end = digitsEnd + 1;
+	    const limit = end + MAX_SAFE_BUILD_LENGTH;
+	    while (end < limit && isIdentifierCharacter(range[end])) {
+	      end++;
+	    }
+	    return end
+	  }
+	  return findVersionNumberEndIndex(range, start, loose, digitRuns)
+	};
+
+	/**
+	 * Reads a prerelease suffix such as -beta.1, one dot-separated piece at a time.
+	 * Loose mode also allows the name without its opening hyphen.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position where the suffix should begin, including -.
+	 * @param {boolean} loose Whether the opening hyphen is optional and zeros allowed.
+	 * @param {DigitRunCache} digitRuns Shared digit-run cache, updated as needed.
+	 * @returns {number} The position after the matched suffix, or start if absent.
+	 * @example findPrereleaseEndIndex('-beta.1+sha', 0, false, digitRuns) // 7, at the plus
+	 * @example findPrereleaseEndIndex('beta', 0, false, digitRuns) // 0; no opening hyphen
+	 */
+	const findPrereleaseEndIndex = (range, start, loose, digitRuns) => {
+	  const hyphen = range[start] === '-';
+	  if (!loose && !hyphen) {
+	    return start
+	  }
+	  const identifierStart = start + (hyphen ? 1 : 0);
+	  let end = findPrereleaseIdentifierEndIndex(range, identifierStart, loose, digitRuns);
+	  if (end === identifierStart) {
+	    if (!loose || !hyphen) {
+	      return start
+	    }
+	    // In loose syntax, a lone hyphen can itself be the identifier.
+	    end = findPrereleaseIdentifierEndIndex(range, start, loose, digitRuns);
+	  }
+	  while (range[end] === '.') {
+	    const next = findPrereleaseIdentifierEndIndex(range, end + 1, loose, digitRuns);
+	    if (next === end + 1) {
+	      break
+	    }
+	    end = next;
+	  }
+	  return end
+	};
+
+	/**
+	 * Reads one build-name piece, such as sha or 123 in +sha.123.
+	 * Stops at a disallowed character or the old regex's length limit.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position where the identifier should begin.
+	 * @returns {number} The position after the identifier, or start if none matches.
+	 * @example findBuildIdentifierEndIndex('sha.123', 0) // 3, at the dot
+	 * @example findBuildIdentifierEndIndex('001', 0) // 3; leading zeros are allowed
+	 */
+	const findBuildIdentifierEndIndex = (range, start) => {
+	  let end = start;
+	  while (end - start < MAX_SAFE_BUILD_LENGTH && isIdentifierCharacter(range[end])) {
+	    end++;
+	  }
+	  return end
+	};
+
+	/**
+	 * Reads optional build metadata such as +sha.123.
+	 * Leaves the position unchanged if there is no plus sign followed by a name.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position where the opening + should be.
+	 * @returns {number} The position after the matched metadata, or start if absent.
+	 * @example findBuildEndIndex('+sha.123 <2', 0) // 8, at the space
+	 * @example findBuildEndIndex('+', 0) // 0; a plus sign alone is not a match
+	 */
+	const findBuildEndIndex = (range, start) => {
+	  if (range[start] !== '+') {
+	    return start
+	  }
+	  let end = findBuildIdentifierEndIndex(range, start + 1);
+	  if (end === start + 1) {
+	    return start
+	  }
+	  while (range[end] === '.') {
+	    const next = findBuildIdentifierEndIndex(range, end + 1);
+	    if (next === end + 1) {
+	      break
+	    }
+	    end = next;
+	  }
+	  return end
+	};
+
+	/**
+	 * Reads three numbers separated by dots, then any prerelease and build suffixes.
+	 * Uses loose rules, so forms such as 01.02.03beta can match here.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position of the first number, after any prefix.
+	 * @param {DigitRunCache} digitRuns Shared digit-run cache, updated as needed.
+	 * @returns {number} The position after the version match, or start if none matches.
+	 * @example findLooseFullVersionEndIndex('1.2.3-beta+sha <2', 0, digitRuns) // 14
+	 * @example findLooseFullVersionEndIndex('1.2', 0, digitRuns) // 0; needs three numbers
+	 */
+	const findLooseFullVersionEndIndex = (range, start, digitRuns) => {
+	  let end = start;
+	  for (let component = 0; component < 3; component++) {
+	    const next = findVersionNumberEndIndex(range, end, true, digitRuns);
+	    if (next === end) {
+	      return start
+	    }
+	    end = next;
+	    if (component < 2) {
+	      if (range[end] !== '.') {
+	        return start
+	      }
+	      end++;
+	    }
+	  }
+	  const prereleaseEnd = findPrereleaseEndIndex(range, end, true, digitRuns);
+	  return findBuildEndIndex(range, prereleaseEnd)
+	};
+
+	/**
+	 * Reads one component of a partial or wildcard version, such as 2 or x in 2.x.
+	 * Numbers use strict leading-zero rules; wildcards take up one character.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position where the component should begin.
+	 * @param {DigitRunCache} digitRuns Shared digit-run cache, updated as needed.
+	 * @returns {number} The position after the component, or start if none matches.
+	 * @example findPartialVersionComponentEndIndex('2.x', 0, digitRuns) // 1, at the dot
+	 * @example findPartialVersionComponentEndIndex('2.x', 2, digitRuns) // 3, after x
+	 */
+	const findPartialVersionComponentEndIndex = (range, start, digitRuns) => {
+	  if (isDigit(range[start])) {
+	    return findVersionNumberEndIndex(range, start, false, digitRuns)
+	  }
+	  return isVersionStart(range[start]) ? start + 1 : start
+	};
+
+	/**
+	 * Reads up to three components, allowing forms such as 1, 1.2, or 1.x.
+	 * After the third component, also reads any strict prerelease and build suffixes.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position of a number or wildcard, after any prefix.
+	 * @param {DigitRunCache} digitRuns Shared digit-run cache, updated as needed.
+	 * @returns {number} The position after the matched version text.
+	 * @example findPartialVersionEndIndex('1.x <2', 0, digitRuns) // 3, at the space
+	 * @example findPartialVersionEndIndex('1.', 0, digitRuns) // 1; the trailing dot is unread
+	 */
+	const findPartialVersionEndIndex = (range, start, digitRuns) => {
+	  let end = findPartialVersionComponentEndIndex(range, start, digitRuns);
+	  for (let component = 0; component < 2; component++) {
+	    if (range[end] !== '.') {
+	      return end
+	    }
+	    const next = findPartialVersionComponentEndIndex(range, end + 1, digitRuns);
+	    if (next === end + 1) {
+	      return end
+	    }
+	    end = next;
+	  }
+	  const prereleaseEnd = findPrereleaseEndIndex(range, end, false, digitRuns);
+	  return findBuildEndIndex(range, prereleaseEnd)
+	};
+
+	/**
+	 * Finds where a version match ends, without deciding whether the range is valid.
+	 * Tries a loose full version first, then a partial or wildcard version, just
+	 * like the old regex's LOOSEPLAIN and XRANGEPLAIN alternatives.
+	 *
+	 * @param {string} range The text to read; it is not changed.
+	 * @param {number} start The position of a number or wildcard, after any prefix.
+	 * @param {DigitRunCache} digitRuns Shared digit-run cache, updated as needed.
+	 * @returns {number} The position where scanning the next candidate can resume.
+	 * @example findVersionEndIndex('1.2.3 <2', 0, digitRuns) // 5, at the space
+	 * @example findVersionEndIndex('1.x <2', 0, digitRuns) // 3, at the space
+	 */
+	const findVersionEndIndex = (range, start, digitRuns) => {
+	  const fullVersionEnd = findLooseFullVersionEndIndex(range, start, digitRuns);
+	  return fullVersionEnd !== start
+	    ? fullVersionEnd
+	    : findPartialVersionEndIndex(range, start, digitRuns)
+	};
+
+	/**
+	 * Finds the one whitespace character the old replacement would remove.
+	 * Keeps leading whitespace, skips an optional operator, and checks immediately
+	 * after it. Returns -1 if there is nothing to remove.
+	 *
+	 * @param {string} range The text containing a candidate already found by the caller.
+	 * @param {number} matchStart The candidate's position, including leading whitespace.
+	 * @returns {number} The position of the removable whitespace, or -1 if absent.
+	 * @example findRemovableWhitespaceIndex(' > 1', 0) // 2; keep the space at position 0
+	 * @example findRemovableWhitespaceIndex('>1', 0) // -1
+	 */
+	const findRemovableWhitespaceIndex = (range, matchStart) => {
+	  let position = matchStart;
+	  if (isWhitespace(range[position])) {
+	    position++;
+	  }
+	  if (range[position] === '<' || range[position] === '>') {
+	    position++;
+	  }
+	  if (range[position] === '=') {
+	    position++;
+	  }
+	  return isWhitespace(range[position]) ? position : -1
+	};
+
+	/**
+	 * Joins an operator to its version, turning > 1.2.3 into >1.2.3.
+	 * Copies everything else according to the old regex's matching rules.
+	 * Moves forward through prefixes and whole versions to avoid repeatedly
+	 * searching the same characters on long inputs.
+	 *
+	 * @param {string} range The range text to process; the original string is unchanged.
+	 * @returns {string} The range with matched operator whitespace removed.
+	 * @example trimComparatorWhitespace('> 1.2.3 < 2') // '>1.2.3 <2'
+	 * @example trimComparatorWhitespace('> invalid') // '> invalid'
+	 */
+	const trimComparatorWhitespace = range => {
+	  let result = '';
+	  let copyFrom = 0;
+	  let cursor = 0;
+	  const digitRuns = { start: -1, end: -1, previousStart: -1, previousEnd: -1 };
+
+	  while (cursor < range.length) {
+	    const matchStart = cursor;
+	    if (range[cursor] === '<' || range[cursor] === '>') {
+	      cursor++;
+	    } else if (!isVersionPrefix(range[cursor]) && !isVersionStart(range[cursor])) {
+	      cursor++;
+	      continue
+	    }
+
+	    // Consume a v/=/whitespace run once, even when no version follows it.
+	    while (cursor < range.length && isVersionPrefix(range[cursor])) {
+	      cursor++;
+	    }
+	    if (!isVersionStart(range[cursor])) {
+	      continue
+	    }
+
+	    const whitespacePosition = findRemovableWhitespaceIndex(range, matchStart);
+	    if (whitespacePosition !== -1) {
+	      result += range.slice(copyFrom, whitespacePosition);
+	      copyFrom = whitespacePosition + 1;
+	    }
+
+	    // Skip the entire match, so a prerelease's trailing v cannot be
+	    // reconsidered as the prefix of another version.
+	    cursor = findVersionEndIndex(range, cursor, digitRuns);
+	  }
+
+	  return result + range.slice(copyFrom)
+	};
+
+	trimComparatorWhitespace_1 = trimComparatorWhitespace;
+	return trimComparatorWhitespace_1;
+}
+
 var range;
 var hasRequiredRange;
 
@@ -48660,7 +49623,7 @@ function requireRange () {
 	    debug('hyphen replace', range);
 
 	    // `> 1.2.3 < 1.2.5` => `>1.2.3 <1.2.5`
-	    range = range.replace(re[t.COMPARATORTRIM], comparatorTrimReplace);
+	    range = trimComparatorWhitespace(range);
 	    debug('comparator trim', range);
 
 	    // `~ 1.2.3` => `~1.2.3`
@@ -48765,11 +49728,11 @@ function requireRange () {
 	const Comparator = requireComparator();
 	const debug = requireDebug();
 	const SemVer = requireSemver$1();
+	const trimComparatorWhitespace = requireTrimComparatorWhitespace();
 	const {
 	  safeRe: re,
 	  src,
 	  t,
-	  comparatorTrimReplace,
 	  tildeTrimReplace,
 	  caretTrimReplace,
 	} = requireRe();
