@@ -636,6 +636,7 @@ function requireSymbols () {
 	  kMaxResponseSize: Symbol('max response size'),
 	  kHTTP2Session: Symbol('http2Session'),
 	  kHTTP2Options: Symbol('http2 options'),
+	  kQueuedAbort: Symbol('queued abort'),
 	  kHTTP2SessionState: Symbol('http2Session state'),
 	  kRetryHandlerDefaultRetry: Symbol('retry agent default retry'),
 	  kConstruct: Symbol('constructable'),
@@ -653,7 +654,8 @@ function requireSymbols () {
 	  kNoProxyAgent: Symbol('no proxy agent'),
 	  kHttpProxyAgent: Symbol('http proxy agent'),
 	  kHttpsProxyAgent: Symbol('https proxy agent'),
-	  kSocks5ProxyAgent: Symbol('socks5 proxy agent')
+	  kSocks5ProxyAgent: Symbol('socks5 proxy agent'),
+	  kInterceptorKind: Symbol('interceptor kind')
 	};
 	return symbols;
 }
@@ -859,7 +861,7 @@ function requireTimers () {
 	  // method (e.g. mocked timers in tests).
 	  if (fastNowTimeout?.refresh) {
 	    fastNowTimeout.refresh();
-	    // fastNowTimeout is not instantiated yet or refresh is not availabe,
+	    // fastNowTimeout is not instantiated yet or refresh is not available,
 	    // create a new Timer.
 	  } else {
 	    clearTimeout(fastNowTimeout);
@@ -3257,6 +3259,8 @@ function requireDiagnostics () {
 	};
 	return diagnostics;
 }
+
+var request$1 = {exports: {}};
 
 var constants$4;
 var hasRequiredConstants$4;
@@ -5908,7 +5912,7 @@ function requireUtil$4 () {
 	  return url
 	}
 
-	const isPotentialleTrustworthyIPv4 = RegExp.prototype.test
+	const isPotentiallyTrustworthyIPv4 = RegExp.prototype.test
 	  .bind(/^127\.(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)\.){2}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d|\d)$/);
 
 	const isPotentiallyTrustworthyIPv6 = RegExp.prototype.test
@@ -5931,7 +5935,7 @@ function requireUtil$4 () {
 	  }
 
 	  // IPv4
-	  return isPotentialleTrustworthyIPv4(origin)
+	  return isPotentiallyTrustworthyIPv4(origin)
 	}
 
 	/**
@@ -7259,11 +7263,10 @@ function requireFormdata () {
 	return formdata;
 }
 
-var request$1;
 var hasRequiredRequest$1;
 
 function requireRequest$1 () {
-	if (hasRequiredRequest$1) return request$1;
+	if (hasRequiredRequest$1) return request$1.exports;
 	hasRequiredRequest$1 = 1;
 
 	const {
@@ -7312,6 +7315,8 @@ function requireRequest$1 () {
 	const kHandler = Symbol('handler');
 	const kController = Symbol('controller');
 	const kResume = Symbol('resume');
+
+	function noop () {}
 
 	class RequestController {
 	  #paused = false
@@ -7729,10 +7734,24 @@ function requireRequest$1 () {
 	    }
 	  }
 
+	  // Fails a request that was aborted before it reached a connection. The
+	  // handler gets an aborted controller, so wrappers such as RetryHandler can
+	  // tell a caller abort apart from a retryable connection failure.
+	  onQueuedAbort (reason) {
+	    this[kController] = createAbortedController(reason);
+	    return this.onResponseError(reason)
+	  }
+
 	  addHeader (key, value) {
 	    processHeader(this, key, value);
 	    return this
 	  }
+	}
+
+	function createAbortedController (reason) {
+	  const controller = new RequestController(noop);
+	  controller.abort(reason);
+	  return controller
 	}
 
 	function processHeader (request, key, val) {
@@ -7845,8 +7864,9 @@ function requireRequest$1 () {
 	  return isFormData(body)
 	}
 
-	request$1 = Request;
-	return request$1;
+	request$1.exports = Request;
+	request$1.exports.createAbortedController = createAbortedController;
+	return request$1.exports;
 }
 
 var dispatcher;
@@ -7856,7 +7876,8 @@ function requireDispatcher () {
 	if (hasRequiredDispatcher) return dispatcher;
 	hasRequiredDispatcher = 1;
 	const EventEmitter = require$$0;
-	const { kOriginless, kUrl } = requireSymbols();
+	const { InvalidArgumentError } = requireErrors();
+	const { kOriginless, kUrl, kInterceptorKind } = requireSymbols();
 
 	class Dispatcher extends EventEmitter {
 	  dispatch () {
@@ -7880,6 +7901,8 @@ function requireDispatcher () {
 	      : this[kUrl]?.origin;
 	    let dispatch = this.dispatch.bind(this);
 
+	    const orderSensitiveKinds = [];
+
 	    for (const interceptor of interceptors) {
 	      if (interceptor == null) {
 	        continue
@@ -7889,11 +7912,29 @@ function requireDispatcher () {
 	        throw new TypeError(`invalid interceptor, expected function received ${typeof interceptor}`)
 	      }
 
+	      if (interceptor[kInterceptorKind] != null) {
+	        orderSensitiveKinds.push(interceptor[kInterceptorKind]);
+	      }
+
 	      dispatch = interceptor(dispatch, interceptorOrigin);
 
 	      if (dispatch == null || typeof dispatch !== 'function' || dispatch.length !== 2) {
 	        throw new TypeError('invalid interceptor')
 	      }
+	    }
+
+	    // Several shipped interceptors are order-sensitive: they cooperate through
+	    // the redirect history threaded on the request context, and the cache
+	    // handler only receives it when the redirect interceptor is composed before
+	    // the cache interceptor. Composing `cache` before `redirect` silently
+	    // disables the cache's redirect-origin guards (cross-origin cache
+	    // poisoning, credential-bearing redirect replay), so fail fast instead of
+	    // storing an attacker-controlled or cross-principal response under a key
+	    // the application trusts.
+	    const cacheIndex = orderSensitiveKinds.indexOf('cache');
+	    const redirectIndex = orderSensitiveKinds.indexOf('redirect');
+	    if (cacheIndex !== -1 && redirectIndex !== -1 && cacheIndex < redirectIndex) {
+	      throw new InvalidArgumentError('the cache interceptor must be composed after the redirect interceptor; composing the cache before the redirect disables the cache\'s cross-origin and credential redirect guards (GHSA-75VM-9G8F-99J4, GHSA-MQG3-3V4R-CM32, GHSA-4W7W-5XRC-9H26, GHSA-7XG3-FPHP-28HG)')
 	    }
 
 	    const originalDispatch = dispatch;
@@ -8112,7 +8153,12 @@ function requireDispatcherBase () {
 
 	      handler.onResponseError(null, err);
 
-	      return false
+	      // The request failed synchronously: no work was queued on this
+	      // dispatcher, no capacity was consumed and no 'drain' event will
+	      // ever follow. Returning false would make callers (e.g. Pool)
+	      // mark this dispatcher as busy waiting for a drain that never
+	      // comes, permanently taking it out of rotation.
+	      return true
 	    }
 	  }
 	}
@@ -13308,6 +13354,7 @@ function requireClientH1 () {
 	const kIdleSocketValidation = Symbol('kIdleSocketValidation');
 	const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout');
 	const kSocketUsed = Symbol('kSocketUsed');
+	const kIdleSince = Symbol('kIdleSince');
 	const kTypeOfService = Symbol('kTypeOfService');
 
 	let extractBody;
@@ -14349,6 +14396,19 @@ function requireClientH1 () {
 	}
 
 	/**
+	 * kIdleSince is recorded when the keep-alive timer is armed, so this never
+	 * expires a socket before that timer is due.
+	 * @param {import('net').Socket} socket
+	 * @returns {boolean}
+	 */
+	function isIdleSocketExpired (socket) {
+	  const parser = socket[kParser];
+	  return parser.timeoutType === TIMEOUT_KEEP_ALIVE &&
+	    parser.timeoutValue > 0 &&
+	    performance.now() - socket[kIdleSince] >= parser.timeoutValue
+	}
+
+	/**
 	 * @param {import('./client.js')} client
 	 */
 	function resumeH1 (client) {
@@ -14363,6 +14423,15 @@ function requireClientH1 () {
 	    } else if (socket[kNoRef] && socket.ref) {
 	      socket.ref();
 	      socket[kNoRef] = false;
+	    }
+
+	    // The keep-alive timer cannot fire while the event loop is blocked, and a
+	    // request dispatched from the poll phase passes the idle socket validation
+	    // below before that timer or a FIN received during the block is processed.
+	    // Check the clock so that an expired socket is not reused.
+	    if (client[kRunning] === 0 && client[kPending] > 0 && isIdleSocketExpired(socket)) {
+	      util.destroy(socket, new InformationalError('socket idle timeout'));
+	      return
 	    }
 
 	    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
@@ -14393,6 +14462,7 @@ function requireClientH1 () {
 
 	    if (client[kSize] === 0) {
 	      if (socket[kParser].timeoutType !== TIMEOUT_KEEP_ALIVE) {
+	        socket[kIdleSince] = performance.now();
 	        socket[kParser].setTimeout(client[kKeepAliveTimeoutValue], TIMEOUT_KEEP_ALIVE);
 	      }
 	    } else if (client[kRunning] > 0 && socket[kParser].statusCode < 200) {
@@ -15186,6 +15256,7 @@ function requireClientH2 () {
 	    HTTP2_HEADER_STATUS,
 	    HTTP2_HEADER_PROTOCOL,
 	    NGHTTP2_NO_ERROR,
+	    NGHTTP2_PROTOCOL_ERROR,
 	    NGHTTP2_REFUSED_STREAM
 	  }
 	} = http2;
@@ -16779,11 +16850,16 @@ function requireClientH2 () {
 	  // noop error sink so that re-delivery cannot go unhandled.
 	  stream.on('error', noop);
 
-	  // Node's HTTP/2 implementation can turn an incomplete Content-Length body
-	  // into a protocol stream error instead of emitting 'end'. Prefer the
-	  // content-length mismatch error when the received byte count proves it.
-	  if (state.responseContentLength != null && state.bytesRead !== state.responseContentLength) {
-	    err = new ResponseContentLengthMismatchError();
+	  // Node may report Content-Length violations as protocol errors.
+	  if (
+	    (err.code === 'ERR_HTTP2_ERROR' ||
+	      (err.code === 'ERR_HTTP2_STREAM_ERROR' && stream.rstCode === NGHTTP2_PROTOCOL_ERROR)) &&
+	    state.responseContentLength != null &&
+	    state.bytesRead !== state.responseContentLength
+	  ) {
+	    const mismatch = new ResponseContentLengthMismatchError();
+	    mismatch.cause = err;
+	    err = mismatch;
 	  }
 
 	  if (typeof stream.rstCode === 'number' && stream.rstCode !== NGHTTP2_NO_ERROR) {
@@ -17147,12 +17223,14 @@ function requireClient () {
 	  kHostAuthority,
 	  kResume,
 	  kHTTP2Options,
-	  kUseMilo
+	  kUseMilo,
+	  kQueuedAbort
 	} = requireSymbols();
 	const connectH1 = requireClientH1();
 	const connectH2 = requireClientH2();
 
 	const kClosedResolve = Symbol('kClosedResolve');
+	const kCancelConnect = Symbol('kCancelConnect');
 
 	const getDefaultNodeMaxHeaderSize = http &&
 	  http.maxHeaderSize &&
@@ -17414,6 +17492,7 @@ function requireClient () {
 	    this[kClosedResolve] = null;
 	    this[kMaxResponseSize] = maxResponseSize > -1 ? maxResponseSize : -1;
 	    this[kHTTPContext] = null;
+	    this[kCancelConnect] = null;
 	    // h2
 	    this[kHTTP2Options] = {
 	      pingInterval: h2Options?.pingInterval ?? pingInterval ?? 60e3,
@@ -17494,6 +17573,8 @@ function requireClient () {
 
 	  [kConnect] (cb) {
 	    connect(this);
+	    // Asked for explicitly: keep it even if no request waits for it.
+	    this[kCancelConnect] = null;
 	    this.once('connect', cb);
 	  }
 
@@ -17507,6 +17588,15 @@ function requireClient () {
 	      queueMicrotask(() => resume(this));
 	    } else {
 	      this[kResume](true);
+	    }
+
+	    if (request.abort === null && !request.aborted) {
+	      // The request is still waiting for a connection: if its handler listens
+	      // to a signal, give it a way to take the request out of the queue.
+	      const onQueued = opts[kQueuedAbort];
+	      if (onQueued !== undefined) {
+	        onQueued((reason) => abortPendingRequest(this, request, reason));
+	      }
 	    }
 
 	    if (this[kResuming] && this[kNeedDrain] !== 2 && this[kBusy]) {
@@ -17559,6 +17649,56 @@ function requireClient () {
 	  }
 	}
 
+	function failQueuedRequest (client, request, reason) {
+	  try {
+	    request.onQueuedAbort(reason);
+	    assert(request.aborted);
+	  } catch (err) {
+	    client.emit('error', err);
+	  }
+	}
+
+	function abortPendingRequest (client, request, reason) {
+	  // The request already settled, or it started and its handler owns the abort.
+	  if (request.aborted || request.abort !== null) {
+	    return
+	  }
+
+	  const queue = client[kQueue];
+	  const idx = queue.indexOf(request, client[kPendingIdx]);
+	  if (idx === -1) {
+	    return
+	  }
+
+	  // _resume() may be handing this request to the connection right now, before
+	  // onRequestStart runs. Leave it there: the handler aborts it once it starts.
+	  if (idx === client[kPendingIdx] && client[kResuming] === 2) {
+	    return
+	  }
+
+	  queue.splice(idx, 1);
+	  failQueuedRequest(client, request, reason);
+
+	  // The client may no longer be busy: emit 'drain' so a Pool can use it again.
+	  client[kResume](true);
+
+	  if (client[kCancelConnect] !== null && client[kSize] === 0) {
+	    // The drain is emitted in a microtask: check once a Pool had the chance to
+	    // hand this client the requests it queued.
+	    queueMicrotask(() => cancelUnusedConnect(client));
+	  }
+	}
+
+	// A connection attempt that no request waits for only holds a connection slot,
+	// until it connects or times out. Destroy it, so the next request starts a new
+	// one instead of waiting for it.
+	function cancelUnusedConnect (client) {
+	  const cancel = client[kCancelConnect];
+	  if (cancel !== null && client[kSize] === 0) {
+	    cancel(new InformationalError('no request waits for this connection'));
+	  }
+	}
+
 	function onError (client, err) {
 	  if (
 	    client[kRunning] === 0 &&
@@ -17605,6 +17745,9 @@ function requireClient () {
 
 	  client[kConnecting] = true;
 
+	  let calledBack = false;
+	  let cancelled = false;
+
 	  if (channels.beforeConnect.hasSubscribers) {
 	    channels.beforeConnect.publish({
 	      connectParams: {
@@ -17621,7 +17764,7 @@ function requireClient () {
 	  }
 
 	  try {
-	    client[kConnector]({
+	    const connecting = client[kConnector]({
 	      host,
 	      hostname,
 	      protocol,
@@ -17629,6 +17772,17 @@ function requireClient () {
 	      servername: client[kServerName],
 	      localAddress: client[kLocalAddress]
 	    }, (err, socket) => {
+	      calledBack = true;
+
+	      if (cancelled) {
+	        if (socket) {
+	          util.destroy(socket.on('error', noop));
+	        }
+	        return
+	      }
+
+	      client[kCancelConnect] = null;
+
 	      if (err) {
 	        handleConnectError(client, err, { host, hostname, protocol, port });
 	        client[kResume]();
@@ -17680,6 +17834,35 @@ function requireClient () {
 	      client.emit('connect', client[kUrl], [client]);
 	      client[kResume]();
 	    });
+
+	    // The attempt can only be cancelled through the socket the connector
+	    // returns. The built-in connector returns it; custom connectors may not.
+	    if (!calledBack && util.isStream(connecting)) {
+	      client[kCancelConnect] = (err) => {
+	        cancelled = true;
+	        client[kCancelConnect] = null;
+	        client[kConnecting] = false;
+
+	        // Not a 'connectionError': that would make a Pool retire this client.
+	        if (channels.connectError.hasSubscribers) {
+	          channels.connectError.publish({
+	            connectParams: {
+	              host,
+	              hostname,
+	              protocol,
+	              port,
+	              version: client[kHTTPContext]?.version,
+	              servername: client[kServerName],
+	              localAddress: client[kLocalAddress]
+	            },
+	            connector: client[kConnector],
+	            error: err
+	          });
+	        }
+
+	        util.destroy(connecting.on('error', noop), err);
+	      };
+	    }
 	  } catch (err) {
 	    handleConnectError(client, err, { host, hostname, protocol, port });
 	    client[kResume]();
@@ -17994,7 +18177,8 @@ function requirePoolBase () {
 	const { PoolStats } = requireStats();
 	const DispatcherBase = requireDispatcherBase();
 	const FixedQueue = requireFixedQueue();
-	const { kConnected, kSize, kRunning, kPending, kQueued, kBusy, kFree, kUrl, kClose, kDestroy, kDispatch } = requireSymbols();
+	const { kConnected, kSize, kRunning, kPending, kQueued, kBusy, kFree, kUrl, kClose, kDestroy, kDispatch, kQueuedAbort } = requireSymbols();
+	const { createAbortedController } = requireRequest$1();
 
 	const kClients = Symbol('clients');
 	const kNeedDrain = Symbol('needDrain');
@@ -18013,6 +18197,8 @@ function requirePoolBase () {
 	const kRemoveClient = Symbol('remove client');
 	const kRetireClient = Symbol('retire client');
 	const kRetiring = Symbol('retiring clients');
+	const kShiftQueue = Symbol('shift queue');
+	const kAbortQueued = Symbol('abort queued');
 
 	// Closes every live client, including clients that have been
 	// taken out of rotation but are still finishing their own
@@ -18026,6 +18212,8 @@ function requirePoolBase () {
 	    super('UNDICI_POOL_QUEUED_REQUEST');
 	    this.opts = opts;
 	    this.handler = handler;
+	    // Cleared once the request leaves the queue, so a late abort is ignored.
+	    this.queued = true;
 	  }
 
 	  dispatch (dispatcher) {
@@ -18065,17 +18253,15 @@ function requirePoolBase () {
 	      return
 	    }
 
-	    const queue = this[kQueue];
 	    let needDrain = false;
 
 	    this[kOnClientDrain](client);
 
 	    while (!needDrain) {
-	      const item = queue.shift();
+	      const item = this[kShiftQueue]();
 	      if (!item) {
 	        break
 	      }
-	      this[kQueued]--;
 	      needDrain = !item.dispatch(client);
 	    }
 
@@ -18088,7 +18274,7 @@ function requirePoolBase () {
 	      // negotiated and hit maxConcurrentStreams. Hand the rest to other
 	      // clients, creating new ones up to the connection limit, instead of
 	      // leaving them for this client to drain one batch at a time.
-	      if (!queue.isEmpty()) {
+	      if (this[kQueued] > 0) {
 	        return this[kDrainQueue](origin, targets)
 	      }
 	    }
@@ -18098,7 +18284,7 @@ function requirePoolBase () {
 	      this.emit('drain', origin, [this, ...targets]);
 	    }
 
-	    if (this[kClosedResolve] && queue.isEmpty()) {
+	    if (this[kClosedResolve] && this[kQueued] === 0) {
 	      return closeClients(this).then(this[kClosedResolve])
 	    }
 	  }
@@ -18108,23 +18294,31 @@ function requirePoolBase () {
 	  [kOnClientDrain] () {}
 
 	  [kDrainQueue] (origin, targets) {
-	    const queue = this[kQueue];
 	    let hasDispatcher = true;
 
-	    while (!queue.isEmpty()) {
-	      const dispatcher = this[kGetDispatcher]();
+	    while (this[kQueued] > 0) {
+	      let dispatcher;
+	      try {
+	        dispatcher = this[kGetDispatcher]();
+	      } catch (err) {
+	        // Selection failed before a dispatcher took ownership of this item.
+	        const item = this[kShiftQueue]();
+	        item.runInAsyncScope(item.handler.onResponseError, item.handler, null, err);
+	        // The error handler may synchronously dispatch and consume capacity.
+	        hasDispatcher = !this.destroyed && this[kHasDispatcher](false);
+	        continue
+	      }
 	      if (!dispatcher) {
 	        hasDispatcher = false;
 	        break
 	      }
 
-	      const item = queue.shift();
-	      this[kQueued]--;
+	      const item = this[kShiftQueue]();
 
 	      if (!item.dispatch(dispatcher)) {
 	        dispatcher[kNeedDrain] = true;
 	        this[kOnClientBusy](dispatcher);
-	        hasDispatcher = this[kHasDispatcher]();
+	        hasDispatcher = this[kHasDispatcher](false);
 	        if (!hasDispatcher) {
 	          break
 	        }
@@ -18136,8 +18330,45 @@ function requirePoolBase () {
 	      this.emit('drain', origin, [this, ...targets]);
 	    }
 
-	    if (this[kClosedResolve] && queue.isEmpty()) {
+	    if (this[kClosedResolve] && this[kQueued] === 0) {
 	      return closeClients(this).then(this[kClosedResolve])
+	    }
+	  }
+
+	  // Aborted requests stay in the queue as tombstones (queued === false) and
+	  // are skipped here; kQueued only counts the live ones.
+	  [kShiftQueue] () {
+	    const queue = this[kQueue];
+	    let item = queue.shift();
+	    while (item !== null && item.queued === false) {
+	      item = queue.shift();
+	    }
+
+	    if (item !== null) {
+	      this[kQueued]--;
+	      item.queued = false;
+	    }
+
+	    return item
+	  }
+
+	  // Called through the handler's kQueuedAbort hook when a queued request is
+	  // aborted.
+	  [kAbortQueued] (item, reason) {
+	    if (!item.queued) {
+	      return
+	    }
+
+	    const { handler } = item;
+	    item.queued = false;
+	    item.opts = null;
+	    item.handler = null;
+	    this[kQueued]--;
+
+	    item.runInAsyncScope(handler.onResponseError, handler, createAbortedController(reason), reason);
+
+	    if (this[kClosedResolve] && this[kQueued] === 0) {
+	      closeClients(this).then(this[kClosedResolve]);
 	    }
 	  }
 
@@ -18202,7 +18433,7 @@ function requirePoolBase () {
 	  }
 
 	  [kClose] () {
-	    if (this[kQueue].isEmpty()) {
+	    if (this[kQueued] === 0) {
 	      return closeClients(this)
 	    } else {
 	      return new Promise((resolve) => {
@@ -18213,7 +18444,7 @@ function requirePoolBase () {
 
 	  [kDestroy] (err) {
 	    while (true) {
-	      const item = this[kQueue].shift();
+	      const item = this[kShiftQueue]();
 	      if (!item) {
 	        break
 	      }
@@ -18234,9 +18465,17 @@ function requirePoolBase () {
 	    const dispatcher = this[kGetDispatcher]();
 
 	    if (!dispatcher) {
+	      const item = new QueuedRequest(opts, handler);
 	      this[kNeedDrain] = true;
-	      this[kQueue].push(new QueuedRequest(opts, handler));
+	      this[kQueue].push(item);
 	      this[kQueued]++;
+
+	      const onQueued = opts[kQueuedAbort];
+	      if (onQueued !== undefined) {
+	        // Give the handler a way to remove the request from the queue as soon
+	        // as it is aborted.
+	        onQueued((reason) => this[kAbortQueued](item, reason));
+	      }
 	    } else if (!dispatcher.dispatch(opts, handler)) {
 	      dispatcher[kNeedDrain] = true;
 	      this[kOnClientBusy](dispatcher);
@@ -18363,7 +18602,7 @@ function requirePool () {
 	  InvalidArgumentError
 	} = requireErrors();
 	const util = requireUtil$5();
-	const { kConnecting, kHTTPContext, kUrl, kQueued } = requireSymbols();
+	const { kConnecting, kHTTPContext, kHTTP2Session, kRemoteSettings, kUrl, kQueued } = requireSymbols();
 	const buildConnector = requireConnect();
 
 	const kOptions = Symbol('options');
@@ -18461,12 +18700,25 @@ function requirePool () {
 	      }
 
 	      if (client === this[kProtocolProbe]) {
-	        // An h2 Client's drain event releases the requests accumulated during
-	        // negotiation onto that Client. If ALPN selected h1, release the probe
-	        // immediately and restore normal Pool fan-out instead.
-	        if (this[kProtocol] !== 'h2') {
-	          this[kProtocolProbe] = null;
-	          this[kDrainQueue](origin, targets.slice(1));
+	        const releaseProbe = () => {
+	          if (client === this[kProtocolProbe]) {
+	            this[kProtocolProbe] = null;
+	            // An empty queue must not release backpressure when this client
+	            // is still saturated and the connection limit prevents fan-out.
+	            // Check capacity without invoking a factory for unused capacity.
+	            if (!this.destroyed && (this[kQueued] > 0 || (!this.closed && this[kHasDispatcher](false)))) {
+	              this[kDrainQueue](origin, targets.slice(1));
+	            }
+	          }
+	        };
+	        const session = client[kHTTP2Session];
+	        // A peer's stream limit can keep the probe busy indefinitely. Once
+	        // SETTINGS arrive, queued work may need another connection without
+	        // waiting for this client's drain event.
+	        if (this[kProtocol] !== 'h2' || session[kRemoteSettings]) {
+	          releaseProbe();
+	        } else {
+	          session.once('remoteSettings', releaseProbe);
 	        }
 	      }
 	    });
@@ -18545,7 +18797,7 @@ function requirePool () {
 	    }
 	  }
 
-	  [kHasDispatcher] () {
+	  [kHasDispatcher] (create = true) {
 	    const clientTtlOption = this[kOptions].clientTtl;
 	    for (let i = 0; i < this[kClients].length; i++) {
 	      const client = this[kClients][i];
@@ -18563,7 +18815,7 @@ function requirePool () {
 	    }
 
 	    if (!this[kConnections] || this[kClients].length < this[kConnections]) {
-	      createClient(this);
+	      if (create) createClient(this);
 	      return true
 	    }
 
@@ -20941,7 +21193,7 @@ function requireRetryHandler () {
 	hasRequiredRetryHandler = 1;
 	const assert = require$$0$1;
 
-	const { kRetryHandlerDefaultRetry } = requireSymbols();
+	const { kRetryHandlerDefaultRetry, kQueuedAbort } = requireSymbols();
 	const { RequestRetryError, RequestAbortedError } = requireErrors();
 	const {
 	  hasSafeIterator,
@@ -21038,6 +21290,11 @@ function requireRetryHandler () {
 	}
 
 	class RetryHandler {
+	  // Takes the retry that waits for a connection out of its queue.
+	  #queuedCancel = null
+	  // Whether retries are dispatched with a hook that sets #queuedCancel.
+	  #tracksQueuedRetry = false
+
 	  constructor (opts, { dispatch, handler }) {
 	    const { retryOptions, ...dispatchOpts } = opts;
 	    const {
@@ -21501,6 +21758,18 @@ function requireRetryHandler () {
 	      };
 	    }
 
+	    if (!this.#tracksQueuedRetry) {
+	      // The consumer's controller still targets the earlier attempt, so an
+	      // abort would not reach a retry that waits for a connection. Keep the
+	      // function that takes it out of its queue; the caller's hook still runs.
+	      this.#tracksQueuedRetry = true;
+	      const onQueued = this.opts[kQueuedAbort];
+	      this.opts[kQueuedAbort] = (cancel) => {
+	        this.#queuedCancel = cancel;
+	        onQueued?.(cancel);
+	      };
+	    }
+
 	    try {
 	      this.retryCountCheckpoint = this.retryCount;
 	      this.dispatch(this.opts, this);
@@ -21562,6 +21831,15 @@ function requireRetryHandler () {
 	  }
 
 	  #onAbort (reason) {
+	    // A retry that waits for a connection is taken out of its queue: its
+	    // dispatcher fails it with an aborted controller, so onResponseError passes
+	    // the abort on instead of retrying. Once the retry started, this does nothing.
+	    const cancel = this.#queuedCancel;
+	    if (cancel !== null) {
+	      this.#queuedCancel = null;
+	      cancel(reason ?? new RequestAbortedError());
+	    }
+
 	    // A consumer abort lands on the controller proxy. If the retry policy is
 	    // still deciding (typically holding a backoff timer), cancel the wait and
 	    // surface the abort immediately instead of letting the request hang until
@@ -22369,6 +22647,123 @@ function requireReadable () {
 	return readable;
 }
 
+var abortSignal;
+var hasRequiredAbortSignal;
+
+function requireAbortSignal () {
+	if (hasRequiredAbortSignal) return abortSignal;
+	hasRequiredAbortSignal = 1;
+
+	const { addAbortListener } = requireUtil$5();
+	const { RequestAbortedError } = requireErrors();
+	const { kQueuedAbort } = requireSymbols();
+
+	const kListener = Symbol('kListener');
+	const kSignal = Symbol('kSignal');
+
+	function abort (self) {
+	  // Keep the reason even when abort is set: a queued request that cannot be
+	  // taken out of its queue is aborted once it starts.
+	  self.reason = self[kSignal]?.reason ?? new RequestAbortedError();
+	  if (self.abort) {
+	    self.abort(self.reason);
+	  }
+	  removeSignal(self);
+	}
+
+	function addSignal (self, signal) {
+	  self.reason = null;
+
+	  self[kSignal] = null;
+	  self[kListener] = null;
+
+	  if (!signal) {
+	    return
+	  }
+
+	  if (signal.aborted) {
+	    self.reason = signal.reason ?? new RequestAbortedError();
+	    return
+	  }
+
+	  self[kSignal] = signal;
+	  self[kListener] = () => {
+	    abort(self);
+	  };
+
+	  addAbortListener(self[kSignal], self[kListener]);
+	}
+
+	function removeSignal (self) {
+	  if (!self[kSignal]) {
+	    return
+	  }
+
+	  if ('removeEventListener' in self[kSignal]) {
+	    self[kSignal].removeEventListener('abort', self[kListener]);
+	  } else {
+	    self[kSignal].removeListener('abort', self[kListener]);
+	  }
+
+	  self[kSignal] = null;
+	  self[kListener] = null;
+	}
+
+	// Dispatchers call the kQueuedAbort hook while a request waits for a
+	// connection, with a function that takes it out of their queue. Until the
+	// request starts, the handler's abort calls that function.
+	//
+	// A retry or a redirect dispatches the same handler again after an earlier
+	// attempt started. The handler's abort then also calls the controller of that
+	// attempt: it does nothing once the attempt is over, and still reaches a
+	// response that a retry resumes.
+	function queuedAbortHook (handler) {
+	  // The abort set by onRequestStart, and the one this hook installed last.
+	  let started = null;
+	  let installed = null;
+	  return (cancel) => {
+	    if (handler.reason) {
+	      cancel(handler.reason);
+	      return
+	    }
+
+	    if (handler.abort !== installed) {
+	      started = handler.abort;
+	    }
+
+	    if (started === null) {
+	      installed = cancel;
+	    } else {
+	      const abortStarted = started;
+	      installed = (reason) => {
+	        abortStarted(reason);
+	        cancel(reason);
+	      };
+	    }
+	    handler.abort = installed;
+	  }
+	}
+
+	// Dispatches a request whose options carry a signal. Requests without a signal
+	// are dispatched directly and never reach this function.
+	function dispatchWithSignal (dispatcher, opts, handler) {
+	  if (handler.reason) {
+	    // Already aborted: fail without dispatching, so no connection is opened.
+	    handler.onResponseError(null, handler.reason);
+	    return
+	  }
+
+	  dispatcher.dispatch({ ...opts, [kQueuedAbort]: queuedAbortHook(handler) }, handler);
+	}
+
+	abortSignal = {
+	  addSignal,
+	  removeSignal,
+	  dispatchWithSignal
+	};
+	return abortSignal;
+}
+
 var hasRequiredApiRequest;
 
 function requireApiRequest () {
@@ -22380,6 +22775,7 @@ function requireApiRequest () {
 	const { Readable } = requireReadable();
 	const { InvalidArgumentError, RequestAbortedError } = requireErrors();
 	const util = requireUtil$5();
+	const { dispatchWithSignal } = requireAbortSignal();
 
 	function noop () {}
 
@@ -22412,6 +22808,11 @@ function requireApiRequest () {
 	        throw new InvalidArgumentError('invalid onInfo callback')
 	      }
 
+	      // Reject before dispatching: onRequestStart only runs once a connection is established.
+	      if (signal?.aborted) {
+	        throw signal.reason ?? new RequestAbortedError()
+	      }
+
 	      super('UNDICI_REQUEST');
 	    } catch (err) {
 	      if (util.isStream(body)) {
@@ -22435,9 +22836,7 @@ function requireApiRequest () {
 	    this.reason = null;
 	    this.removeAbortListener = null;
 
-	    if (signal?.aborted) {
-	      this.reason = signal.reason ?? new RequestAbortedError();
-	    } else if (signal) {
+	    if (signal) {
 	      this.removeAbortListener = util.addAbortListener(signal, () => {
 	        this.reason = signal.reason ?? new RequestAbortedError();
 	        if (this.res) {
@@ -22605,7 +23004,11 @@ function requireApiRequest () {
 	  try {
 	    const handler = new RequestHandler(opts, callback);
 
-	    this.dispatch(opts, handler);
+	    if (opts.signal == null) {
+	      this.dispatch(opts, handler);
+	    } else {
+	      dispatchWithSignal(this, opts, handler);
+	    }
 	  } catch (err) {
 	    if (typeof callback !== 'function') {
 	      throw err
@@ -22620,73 +23023,6 @@ function requireApiRequest () {
 	return apiRequest.exports;
 }
 
-var abortSignal;
-var hasRequiredAbortSignal;
-
-function requireAbortSignal () {
-	if (hasRequiredAbortSignal) return abortSignal;
-	hasRequiredAbortSignal = 1;
-
-	const { addAbortListener } = requireUtil$5();
-	const { RequestAbortedError } = requireErrors();
-
-	const kListener = Symbol('kListener');
-	const kSignal = Symbol('kSignal');
-
-	function abort (self) {
-	  if (self.abort) {
-	    self.abort(self[kSignal]?.reason);
-	  } else {
-	    self.reason = self[kSignal]?.reason ?? new RequestAbortedError();
-	  }
-	  removeSignal(self);
-	}
-
-	function addSignal (self, signal) {
-	  self.reason = null;
-
-	  self[kSignal] = null;
-	  self[kListener] = null;
-
-	  if (!signal) {
-	    return
-	  }
-
-	  if (signal.aborted) {
-	    abort(self);
-	    return
-	  }
-
-	  self[kSignal] = signal;
-	  self[kListener] = () => {
-	    abort(self);
-	  };
-
-	  addAbortListener(self[kSignal], self[kListener]);
-	}
-
-	function removeSignal (self) {
-	  if (!self[kSignal]) {
-	    return
-	  }
-
-	  if ('removeEventListener' in self[kSignal]) {
-	    self[kSignal].removeEventListener('abort', self[kListener]);
-	  } else {
-	    self[kSignal].removeListener('abort', self[kListener]);
-	  }
-
-	  self[kSignal] = null;
-	  self[kListener] = null;
-	}
-
-	abortSignal = {
-	  addSignal,
-	  removeSignal
-	};
-	return abortSignal;
-}
-
 var apiStream;
 var hasRequiredApiStream;
 
@@ -22698,7 +23034,7 @@ function requireApiStream () {
 	const { AsyncResource } = require$$1$3;
 	const { InvalidArgumentError, InvalidReturnValueError } = requireErrors();
 	const util = requireUtil$5();
-	const { addSignal, removeSignal } = requireAbortSignal();
+	const { addSignal, removeSignal, dispatchWithSignal } = requireAbortSignal();
 
 	function noop () {}
 
@@ -22951,7 +23287,11 @@ function requireApiStream () {
 	  try {
 	    const handler = new StreamHandler(opts, factory, callback);
 
-	    this.dispatch(opts, handler);
+	    if (opts.signal == null) {
+	      this.dispatch(opts, handler);
+	    } else {
+	      dispatchWithSignal(this, opts, handler);
+	    }
 	  } catch (err) {
 	    if (typeof callback !== 'function') {
 	      throw err
@@ -22986,7 +23326,7 @@ function requireApiPipeline () {
 	} = requireErrors();
 	const util = requireUtil$5();
 	const { kBodyUsed } = requireSymbols();
-	const { addSignal, removeSignal } = requireAbortSignal();
+	const { addSignal, removeSignal, dispatchWithSignal } = requireAbortSignal();
 
 	function noop () {}
 
@@ -23227,7 +23567,12 @@ function requireApiPipeline () {
 	function pipeline (opts, handler) {
 	  try {
 	    const pipelineHandler = new PipelineHandler(opts, handler);
-	    this.dispatch({ ...opts, body: pipelineHandler.req }, pipelineHandler);
+	    const pipelineOpts = { ...opts, body: pipelineHandler.req };
+	    if (opts.signal == null) {
+	      this.dispatch(pipelineOpts, pipelineHandler);
+	    } else {
+	      dispatchWithSignal(this, pipelineOpts, pipelineHandler);
+	    }
 	    return pipelineHandler.ret
 	  } catch (err) {
 	    return new PassThrough().destroy(err)
@@ -23250,7 +23595,7 @@ function requireApiUpgrade () {
 	const assert = require$$0$1;
 	const util = requireUtil$5();
 	const { kHTTP2Stream } = requireSymbols();
-	const { addSignal, removeSignal } = requireAbortSignal();
+	const { addSignal, removeSignal, dispatchWithSignal } = requireAbortSignal();
 
 	class UpgradeHandler extends AsyncResource {
 	  constructor (opts, callback) {
@@ -23353,7 +23698,11 @@ function requireApiUpgrade () {
 	      method: opts.method || 'GET',
 	      upgrade: opts.protocol || 'Websocket'
 	    };
-	    this.dispatch(upgradeOpts, upgradeHandler);
+	    if (opts.signal == null) {
+	      this.dispatch(upgradeOpts, upgradeHandler);
+	    } else {
+	      dispatchWithSignal(this, upgradeOpts, upgradeHandler);
+	    }
 	  } catch (err) {
 	    if (typeof callback !== 'function') {
 	      throw err
@@ -23378,7 +23727,7 @@ function requireApiConnect () {
 	const { AsyncResource } = require$$1$3;
 	const { InvalidArgumentError, SocketError } = requireErrors();
 	const util = requireUtil$5();
-	const { addSignal, removeSignal } = requireAbortSignal();
+	const { addSignal, removeSignal, dispatchWithSignal } = requireAbortSignal();
 
 	class ConnectHandler extends AsyncResource {
 	  constructor (opts, callback) {
@@ -23473,7 +23822,11 @@ function requireApiConnect () {
 	  try {
 	    const connectHandler = new ConnectHandler(opts, callback);
 	    const connectOptions = { ...opts, method: 'CONNECT' };
-	    this.dispatch(connectOptions, connectHandler);
+	    if (opts.signal == null) {
+	      this.dispatch(connectOptions, connectHandler);
+	    } else {
+	      dispatchWithSignal(this, connectOptions, connectHandler);
+	    }
 	  } catch (err) {
 	    if (typeof callback !== 'function') {
 	      throw err
@@ -26909,9 +27262,10 @@ function requireRedirect () {
 	hasRequiredRedirect = 1;
 
 	const RedirectHandler = requireRedirectHandler();
+	const { kInterceptorKind } = requireSymbols();
 
 	function createRedirectInterceptor ({ maxRedirections: defaultMaxRedirections, throwOnMaxRedirect: defaultThrowOnMaxRedirect, stripHeadersOnRedirect: defaultStripHeadersOnRedirect, stripHeadersOnCrossOriginRedirect: defaultStripHeadersOnCrossOriginRedirect } = {}) {
-	  return (dispatch) => {
+	  const interceptor = (dispatch) => {
 	    return function Intercept (opts, handler) {
 	      const { maxRedirections = defaultMaxRedirections, throwOnMaxRedirect = defaultThrowOnMaxRedirect, stripHeadersOnRedirect = defaultStripHeadersOnRedirect, stripHeadersOnCrossOriginRedirect = defaultStripHeadersOnCrossOriginRedirect, ...rest } = opts;
 
@@ -26923,7 +27277,9 @@ function requireRedirect () {
 	      const redirectHandler = new RedirectHandler(dispatch, maxRedirections, dispatchOpts, handler);
 	      return dispatch(dispatchOpts, redirectHandler)
 	    }
-	  }
+	  };
+	  interceptor[kInterceptorKind] = 'redirect';
+	  return interceptor
 	}
 
 	redirect = createRedirectInterceptor;
@@ -28469,7 +28825,7 @@ function requireCache$2 () {
 
 	/**
 	 * Note: this deviates from the spec a little. Empty etags ("", W/"") are valid,
-	 *  however, including them in cached resposnes serves little to no purpose.
+	 *  however, including them in cached responses serves little to no purpose.
 	 *
 	 * @see https://www.rfc-editor.org/rfc/rfc9110.html#name-etag
 	 *
@@ -29681,7 +30037,7 @@ function requireCacheHandler () {
 	        deleteCachedValue(this.#store, this.#cacheKey);
 	      }
 
-	      // Don't have anything to tell us this response is cachable and we're not
+	      // Don't have anything to tell us this response is cacheable and we're not
 	      //  caching by default
 	      return downstreamOnHeaders()
 	    }
@@ -30981,7 +31337,9 @@ function requireCache$1 () {
 	  isEtagUsable
 	} = requireCache$2();
 	const { AbortError } = requireErrors();
+	const { kQueuedAbort } = requireSymbols();
 	const { parseHttpDate } = requireDate();
+	const { kInterceptorKind } = requireSymbols();
 
 	/**
 	 * @param {(string | RegExp)[] | undefined} origins
@@ -31504,7 +31862,10 @@ function requireCache$1 () {
 	        dispatch(
 	          {
 	            ...opts,
-	            headers
+	            headers,
+	            // The revalidation is not the caller's request: aborting the
+	            // caller must not cancel it while it waits for a connection.
+	            [kQueuedAbort]: undefined
 	          },
 	          new CacheHandler(globalOpts, cacheKey, {
 	            // Silent handler that just updates the cache
@@ -31628,7 +31989,7 @@ function requireCache$1 () {
 	    }
 	  }
 
-	  return (dispatch, interceptorOrigin) => {
+	  const interceptor = (dispatch, interceptorOrigin) => {
 	    return (opts, handler) => {
 	      const requestOrigin = getInterceptorOrigin(opts, interceptorOrigin);
 	      if (!requestOrigin || arrayIncludes(safeMethodsToNotCache, opts.method)) {
@@ -31730,7 +32091,9 @@ function requireCache$1 () {
 	        )
 	      }
 	    }
-	  }
+	  };
+	  interceptor[kInterceptorKind] = 'cache';
+	  return interceptor
 	};
 	return cache$1;
 }
@@ -31846,8 +32209,6 @@ function requireDecompress () {
 	    }
 	  })
 	}
-
-	let warningEmitted = /** @type {boolean} */ (false);
 
 	/**
 	 * @typedef {Object} DecompressHandlerOptions
@@ -32292,15 +32653,6 @@ function requireDecompress () {
 	 * @returns {Function} - Interceptor function
 	 */
 	function createDecompressInterceptor (options = {}) {
-	  // Emit experimental warning only once
-	  if (!warningEmitted) {
-	    process.emitWarning(
-	      'DecompressInterceptor is experimental and subject to change',
-	      'ExperimentalWarning'
-	    );
-	    warningEmitted = true;
-	  }
-
 	  return (dispatch) => {
 	    return (opts, handler) => {
 	      if (opts.method === 'HEAD') {
@@ -32876,6 +33228,7 @@ function requireDeduplicate () {
 	const util = requireUtil$5();
 	const DeduplicationHandler = requireDeduplicationHandler();
 	const { getInterceptorOrigin, normalizeHeaders, makeCacheKey, makeDeduplicationKey } = requireCache$2();
+	const { kInterceptorKind } = requireSymbols();
 
 	const pendingRequestsChannel = diagnosticsChannel.channel('undici:request:pending-requests');
 
@@ -32929,7 +33282,7 @@ function requireDeduplicate () {
 	   */
 	  const pendingRequests = new Map();
 
-	  return (dispatch, interceptorOrigin) => {
+	  const interceptor = (dispatch, interceptorOrigin) => {
 	    return (opts, handler) => {
 	      const requestOrigin = getInterceptorOrigin(opts, interceptorOrigin);
 	      if (!requestOrigin || opts.upgrade || methods.includes(opts.method) === false) {
@@ -32986,7 +33339,9 @@ function requireDeduplicate () {
 
 	      return dispatch(opts, deduplicationHandler)
 	    }
-	  }
+	  };
+	  interceptor[kInterceptorKind] = 'deduplicate';
+	  return interceptor
 	};
 	return deduplicate;
 }
@@ -36470,7 +36825,7 @@ function requireFetch () {
 	const EE = require$$0;
 	const { Readable, pipeline, finished, isErrored, isReadable } = require$$0$2;
 	const { addAbortListener, bufferToLowerCasedHeaderName } = requireUtil$5();
-	const { SocketError } = requireErrors();
+	const { SocketError, InformationalError } = requireErrors();
 	const { dataURLProcessor, serializeAMimeType, minimizeSupportedMimeType } = requireDataUrl();
 	const { getGlobalDispatcher } = requireGlobal();
 	const { webidl } = requireWebidl();
@@ -38688,6 +39043,10 @@ function requireFetch () {
 	              }
 	            }
 
+	            // The response will be exposed without a body, so any content the
+	            // server sends is disregarded (see main fetch step 19).
+	            this.nullBodyStatus = nullBodyStatus.includes(status);
+
 	            this.body = new Readable({ read: () => controller.resume() });
 
 	            const onError = (err) => this.onResponseError(controller, err);
@@ -38707,6 +39066,14 @@ function requireFetch () {
 	          },
 
 	          onResponseData (controller, chunk) {
+	            if (this.nullBodyStatus) {
+	              // The server sent content in a response that must not have any.
+	              // Nobody can read it, so close the connection instead of waiting
+	              // for the server to finish sending it.
+	              controller.abort(new InformationalError('response with null body status has content'));
+	              return
+	            }
+
 	            if (fetchParams.controller.dump) {
 	              return
 	            }
@@ -38744,6 +39111,13 @@ function requireFetch () {
 	          onResponseError (controller, error) {
 	            if (this.abort) {
 	              fetchParams.controller.off('terminated', this.abort);
+	            }
+
+	            if (this.nullBodyStatus) {
+	              // The response has no body, so a failure while receiving the
+	              // disregarded content must not turn it into a network error.
+	              this.body?.destroy();
+	              return
 	            }
 
 	            if (
